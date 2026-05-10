@@ -315,7 +315,9 @@
 
 - 候选：RAVE（实时音频变分自编码器）、DDSP（可微分数字信号处理）、SNN（脉冲神经网络，适合时间动力学）、RNN/GRU 变体
 - 评估维度：实时性（推理延迟 < 10ms）、可训练性、拓扑可调制性、声音质量
-- 选型待完成
+- **选型已完成** → [NEURAL_ARCHITECTURE_SURVEY.md](./NEURAL_ARCHITECTURE_SURVEY.md)
+- **首选方案**：DDSP + Hypernetwork — Encoder 权重调制（长期发育）+ DSP 参数偏置（短期反馈）
+- **长期储备**：SNN 混合架构（STDP + 神经调节），待神经形态硬件和 SNN 音频生成研究成熟
 
 ### 9.2 平台
 
@@ -339,7 +341,7 @@
 1. 四个能量方向的具体数量是否最优？原型阶段验证后可能增删
 2. Voice allocation 策略（循环 / LRU / 音高亲和度）
 3. 相变的具体阈值和方向间的相互作用——需要在实际系统中试出
-4. 神经网络具体架构选型（RAVE / DDSP / SNN / 其他）
+4. 神经网络具体架构选型（RAVE / DDSP / SNN / 其他）→ **已解决：DDSP + Hypernetwork，详见 NEURAL_ARCHITECTURE_SURVEY.md**
 5. 传统合成 fallback 的切换粒度和条件
 6. 快捷键唤起的具体交互设计
 7. 训练数据策略和训练流程
