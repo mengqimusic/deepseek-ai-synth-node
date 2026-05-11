@@ -353,6 +353,42 @@
 
 **代码位置**：`synth/` (core), `scripts/` (entry points), `configs/phase1.yaml`, `tests/`
 
+### 9.5 Phase 2 完成 — 能量→参数映射 (2026-05-11)
+
+**实现方式**：手动设计的信号处理规则，无 hypernetwork。四个方向独立可组合。
+
+**EnergyBiasModule** (`synth/energy/biases.py`) — 无学习参数，纯信号处理：
+
+| 方向 | 机制 | 状态 |
+|------|------|------|
+| 张 (Tension) | 幂律变换谐波锐化：harm^γ, γ=1+level×4 | 静态 |
+| 扰 (Turbulence) | 每谐波 AM 调制(25-55Hz)产生音频速率边带 + 噪声 mel 波纹增强(×1.2) | 动态（AM 相位 buffer）|
+| 吟 (Resonance) | 频谱倾斜扫频(0.25-1.2Hz, ±80% depth)，dark↔bright 连续摆动，反馈调制扫速 | 动态（时钟相位+反馈 buffer）|
+| 忆 (Memory) | 600ms 延迟线环形缓冲快照混合（配合音高变化可听）| 动态（延迟线 buffer）|
+
+**交互式测试** (`scripts/phase2_interactive.py`)：
+- 实时 DDSP 推理（单帧 GRU + energy bias + DSP 合成）
+- 音频 callback 线程 + curses TUI（键盘 1-4 toggle 能量方向, ↑↓←→ 调音高/响度）
+- 能量有 attack (30ms) / release (150ms) 平滑防止 click
+- `--render` 模式支持离线渲染到 WAV
+- 依赖：`sounddevice`
+
+**监听测试** (`outputs/phase2/`)：
+- `baseline.wav` — 原始音色
+- `tension.wav` — 谐波收紧效果
+- `turbulence.wav` — 边带纹理效果
+- `resonance.wav` — 共振流动效果
+- `memory.wav` — 历史回声效果
+- `phase2_demo.wav` — 四方向依次 ramp
+
+**量化验证**（100ms chunk RMS 分析）：
+- 张：RMS -47%，peak -65%，强弱谐波比 6000×
+- 扰：peak +30%，RMS 不变，AM 边带纹理
+- 吟：RMS max/min = **4.5×**（基线仅 1.3×），~1.4s dark↔bright 扫频周期
+- 忆：delay-line 600ms，音高 sweep 时新旧质感 RMS 差显著
+
+**A/B 监听文件**：`outputs/phase2/ab/{tension,turbulence,resonance,memory}_ab.wav`
+
 ---
 
 ## 10. 开放问题
