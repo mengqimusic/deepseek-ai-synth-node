@@ -61,12 +61,14 @@ class FilteredNoiseSynth(nn.Module):
         fb = fb / row_sum
         return fb.float()
 
-    def forward(self, noise_magnitudes: torch.Tensor) -> torch.Tensor:
+    def forward(self, noise_magnitudes: torch.Tensor,
+                generator: torch.Generator | None = None) -> torch.Tensor:
         """
         Generate filtered noise audio from per-frame noise magnitudes.
 
         Args:
             noise_magnitudes: [B, T, n_magnitudes]
+            generator: optional deterministic random generator
 
         Returns:
             audio: [B, T * block_size]
@@ -76,7 +78,8 @@ class FilteredNoiseSynth(nn.Module):
         dtype = noise_magnitudes.dtype
 
         # Generate all noise at once: [B, T, block_size]
-        noise = torch.randn(B, T, self.block_size, device=device, dtype=dtype)
+        noise = torch.randn(B, T, self.block_size, device=device, dtype=dtype,
+                            generator=generator)
 
         # Batched FFT: [B*T, n_bins]
         noise_flat = noise.reshape(B * T, self.block_size)

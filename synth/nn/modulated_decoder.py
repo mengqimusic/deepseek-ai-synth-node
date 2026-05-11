@@ -124,6 +124,49 @@ class ModulatedDecoder(nn.Module):
         return harmonic_amps, noise_mags
 
     @torch.no_grad()
+    def forward_step(
+        self,
+        f0_scaled: torch.Tensor,
+        loudness: torch.Tensor,
+        energy_state: torch.Tensor,
+        gru_hidden: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Single-frame modulated forward with GRU state for real-time inference.
+
+        Args:
+            f0_scaled:   [1, 1] log-scaled f0
+            loudness:    [1, 1] loudness in dB
+            energy_state: [1, 4] normalized energy accumulation
+            gru_hidden:  [1, 1, hidden_size] or None (zeros for first frame)
+
+        Returns:
+            harmonic_amps: [1, 1, n_harmonics] — sigmoid'd
+            noise_mags:    [1, 1, n_magnitudes] — sigmoid'd
+            new_gru_hidden: [1, 1, hidden_size]
+        """
+        deltas = self.hypernetwork(energy_state)
+
+        x = torch.stack([f0_scaled, loudness], dim=-1)  # [1, 1, 2]
+        x = self.base.pre_mlp(x)                        # [1, 1, H]
+        x, h = self.base.gru(x, gru_hidden)              # [1, 1, H], [1, 1, H]
+        x = self.base.post_mlp(x)                        # [1, 1, H]
+
+        # Modulated harm_head
+        eff_harm_W = self.base.harm_head.weight.unsqueeze(0) + deltas["delta_W_harm"]
+        eff_harm_b = self.base.harm_head.bias.unsqueeze(0) + deltas["delta_b_harm"]
+        harm_out = torch.bmm(x, eff_harm_W.transpose(1, 2)) + eff_harm_b.unsqueeze(1)
+        harmonic_amps = torch.sigmoid(harm_out)
+
+        # Modulated noise_head
+        eff_noise_W = self.base.noise_head.weight.unsqueeze(0) + deltas["delta_W_noise"]
+        eff_noise_b = self.base.noise_head.bias.unsqueeze(0) + deltas["delta_b_noise"]
+        noise_out = torch.bmm(x, eff_noise_W.transpose(1, 2)) + eff_noise_b.unsqueeze(1)
+        noise_mags = torch.sigmoid(noise_out)
+
+        return harmonic_amps, noise_mags, h.detach()
+
+    @torch.no_grad()
     def forward_neutral(
         self,
         f0_scaled: torch.Tensor,

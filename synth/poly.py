@@ -16,6 +16,8 @@ import torch.nn as nn
 
 from synth.dsp.processors import midi_to_hz
 from synth.nn.decoder import DDSPDecoder
+from synth.nn.hypernetwork import Hypernetwork
+from synth.nn.modulated_decoder import ModulatedDecoder
 from synth.dsp.harmonic import WavetableHarmonicSynth
 from synth.dsp.noise import FilteredNoiseSynth
 from synth.voice import VoiceModule, VoiceState, ENERGY_NAMES
@@ -78,11 +80,22 @@ class PolyphonicSynth(nn.Module):
         n_magnitudes: int = 65,
         sample_rate: int = 16000,
         block_size: int = 64,
+        hypernetwork: Hypernetwork | None = None,
     ):
         super().__init__()
         self.num_voices = num_voices
         self.block_size = block_size
         self.sample_rate = sample_rate
+
+        # Create modulated decoder if hypernetwork is available
+        if hypernetwork is not None:
+            modulated_decoder = ModulatedDecoder(
+                base_decoder=decoder,
+                hypernetwork=hypernetwork,
+                frozen_decoder=True,
+            )
+        else:
+            modulated_decoder = None
 
         self.voices = nn.ModuleList([
             VoiceModule(
@@ -94,6 +107,7 @@ class PolyphonicSynth(nn.Module):
                 n_magnitudes=n_magnitudes,
                 sample_rate=sample_rate,
                 block_size=block_size,
+                modulated_decoder=modulated_decoder,
             )
             for i in range(num_voices)
         ])
@@ -205,7 +219,7 @@ class PolyphonicSynth(nn.Module):
             loudness = voice.state.active_loudness
             levels = self._energy_levels[voice_id]
 
-            harm, noise, f0_tensor = voice.process_params(f0_hz, loudness, levels)
+            harm, noise, _f0_tensor = voice.process_params(f0_hz, loudness, levels)
 
             vp = {
                 "voice_id": voice_id,
@@ -298,6 +312,8 @@ class PolyphonicSynth(nn.Module):
     def reset_all(self):
         """Reset all Voice states (destructive — clears developmental history)."""
         self.all_notes_off()
+        self.allocator._next = 0
+        self.allocator._active_notes.clear()
         for voice in self.voices:
             voice.reset_full()
         self._energy_levels = [
@@ -309,6 +325,6 @@ class PolyphonicSynth(nn.Module):
         if 0 <= voice_id < self.num_voices:
             for midi, vid in list(self.allocator._active_notes.items()):
                 if vid == voice_id:
-                    self.note_off(midi)
+                    del self.allocator._active_notes[midi]
             self.voices[voice_id].reset_full()
             self._energy_levels[voice_id] = {k: 0.0 for k in ENERGY_NAMES}

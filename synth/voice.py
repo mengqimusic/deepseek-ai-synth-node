@@ -80,10 +80,12 @@ class VoiceModule(nn.Module):
         n_magnitudes: int = 65,
         sample_rate: int = 16000,
         block_size: int = 64,
+        modulated_decoder: nn.Module | None = None,  # shared ModulatedDecoder
     ):
         super().__init__()
         self.voice_id = voice_id
         self.decoder = decoder
+        self.modulated_decoder = modulated_decoder
         self.harmonic_synth = harmonic_synth
         self.noise_synth = noise_synth
         self.block_size = block_size
@@ -99,6 +101,8 @@ class VoiceModule(nn.Module):
 
         self.state = VoiceState(voice_id=voice_id)
         self._gru_hidden = None  # [1, 1, hidden_size] or None
+        self._noise_gen = torch.Generator()
+        self._noise_gen.manual_seed(voice_id + 1)  # per-voice deterministic noise
 
     def _apply_phase_baseline(self, levels: dict[str, float]) -> dict[str, float]:
         """Apply phase-based baseline floors to energy levels."""
@@ -196,18 +200,29 @@ class VoiceModule(nn.Module):
             # Update competition profile
             self._update_competition_profile()
 
-            # Decoder inference with per-voice GRU state
+            # Decoder inference — hypernetwork-modulated or vanilla
             f0 = torch.tensor([[f0_hz]], device=device)
             loudness = torch.tensor([[loudness_db]], device=device)
             f0_scaled = scale_f0(f0)
 
-            x = torch.stack([f0_scaled, loudness], dim=-1)  # [1, 1, 2]
-            x = self.decoder.pre_mlp(x)
-            x, h = self.decoder.gru(x, self._gru_hidden)
-            self._gru_hidden = h.detach()
-            x = self.decoder.post_mlp(x)
-            harm = torch.sigmoid(self.decoder.harm_head(x))
-            noise = torch.sigmoid(self.decoder.noise_head(x))
+            if self.modulated_decoder is not None:
+                energy_tensor = torch.tensor([[
+                    effective_levels["tension"],
+                    effective_levels["turbulence"],
+                    effective_levels["resonance"],
+                    effective_levels["memory"]
+                ]], device=device)
+                harm, noise, self._gru_hidden = self.modulated_decoder.forward_step(
+                    f0_scaled, loudness, energy_tensor, self._gru_hidden
+                )
+            else:
+                x = torch.stack([f0_scaled, loudness], dim=-1)  # [1, 1, 2]
+                x = self.decoder.pre_mlp(x)
+                x, h = self.decoder.gru(x, self._gru_hidden)
+                self._gru_hidden = h.detach()
+                x = self.decoder.post_mlp(x)
+                harm = torch.sigmoid(self.decoder.harm_head(x))
+                noise = torch.sigmoid(self.decoder.noise_head(x))
 
             # Apply energy bias
             harm, noise = self.energy_module(harm, noise, effective_levels)
@@ -232,7 +247,9 @@ class VoiceModule(nn.Module):
             audio: [block_size] numpy array
         """
         with torch.no_grad():
-            audio = self.harmonic_synth(harm_amps, f0_hz) + self.noise_synth(noise_mags)
+            audio = self.harmonic_synth(harm_amps, f0_hz) + self.noise_synth(
+                noise_mags, generator=self._noise_gen
+            )
             return audio.squeeze(0).squeeze(0).cpu().numpy().astype("float32")
 
     def process_frame(
@@ -256,9 +273,10 @@ class VoiceModule(nn.Module):
         return audio, harm_out, noise_out
 
     def reset(self):
-        """Reset GRU hidden state and energy module state buffers."""
+        """Reset GRU hidden state, energy module state buffers, and noise generator."""
         self._gru_hidden = None
         self.energy_module.reset_state()
+        self._noise_gen.manual_seed(self.voice_id + 1)
 
     def reset_full(self):
         """Full reset including developmental state (destructive)."""
