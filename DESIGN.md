@@ -332,6 +332,27 @@
 - **Voice 间关系的涌现**：串扰和耦合如何在长时间运行中自然形成
 - **训练数据**：神经音频生成模型的训练数据策略（合成数据 / 录制数据 / 在线学习）
 
+### 9.4 Phase 1 完成 — DDSP 基础验证 (2026-05-11)
+
+**模型架构**：
+- `DDSPDecoder`: MLP(2→180) → GRU(180→180) → MLP(180→180) → harm_head(100) + noise_head(65)
+- 258,465 参数（仅 decoder，harmonic/noise synth 无学习参数）
+- 无 learned encoder（Phase 1 用固定 DSP 提取 f0/loudness 作为输入）
+- `WavetableHarmonicSynth`：IFFT 构建单周期波形 → 查表 + 线性插值合成
+- `FilteredNoiseSynth`：白噪声 → FFT → mel filterbank → IFFT
+
+**训练数据**：135 个合成长笛片段（E2-C6, 3 力度层, 9 分钟）
+
+**训练结果**（3000 steps, MPS GPU）：
+- val_loss: 10.22 → 3.79 (-62.9%)
+
+**延迟基准**（CPU）：
+- 每帧 0.192ms（Decoder 0.082ms, Harmonic 0.093ms, Noise 0.017ms）
+- 实时因子 **0.048**（20× 快于实时，远超 <10ms 硬约束）
+- Wavetable 优化是关键——若无此优化，harmonic synth 将占主导成本
+
+**代码位置**：`synth/` (core), `scripts/` (entry points), `configs/phase1.yaml`, `tests/`
+
 ---
 
 ## 10. 开放问题
@@ -344,7 +365,7 @@
 4. 神经网络具体架构选型（RAVE / DDSP / SNN / 其他）→ **已解决：DDSP + Hypernetwork，详见 NEURAL_ARCHITECTURE_SURVEY.md**
 5. 传统合成 fallback 的切换粒度和条件
 6. 快捷键唤起的具体交互设计
-7. 训练数据策略和训练流程
+7. 训练数据策略和训练流程 → **Phase 1 已验证：合成数据 + f0/loudness 预处理，小数据集可行**
 8. 是否支持多于 5 个 Voice（可扩展性）
 9. 物理形态的最终选择（Eurorack / 桌面 / 软件）
 

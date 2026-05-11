@@ -1,0 +1,23 @@
+data:
+  sample_rate: 16000
+  hop_size: 64
+  block_size: 64
+  clip_duration_sec: 4.0
+  f0_min_hz: 20.0
+  f0_max_hz: 2000.0
+  pre_emphasis_coef: 0.95
+
+model:
+  hidden_size: 180
+  n_harmonics: 100
+  n_magnitudes: 65
+  table_size: 2048
+
+training:
+  batch_size: 8
+  learning_rate: 3.0e-4
+  total_steps: 3000
+  fft_sizes: [2048, 1024, 512, 256, 128]
+  log_interval: 100
+  ckpt_interval: 1500
+  val_steps: 20

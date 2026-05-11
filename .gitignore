@@ -28,3 +28,9 @@ credentials.*
 
 # Planning artifacts (if using GSD)
 .planning/
+
+# Project data
+data/raw/
+data/processed/
+checkpoints/
+outputs/
