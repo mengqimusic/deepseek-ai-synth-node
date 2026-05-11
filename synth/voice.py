@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
@@ -106,6 +107,17 @@ class VoiceModule(nn.Module):
         self._noise_gen = torch.Generator()
         self._noise_gen.manual_seed(voice_id + 1)  # per-voice deterministic noise
 
+        # Energy dynamics
+        self.energy_attack_ms = 30.0   # attack smoothing time constant
+        self.energy_release_ms = 150.0  # release smoothing time constant
+        self.energy_burst_factor = 0.3  # burst as fraction of current level on note-on
+        self.energy_burst_decay_ms = 100.0  # burst decay time constant
+        self._energy_smooth = {k: 0.0 for k in ENERGY_NAMES}
+        self._burst_energy = {k: 0.0 for k in ENERGY_NAMES}
+        self._attack_alpha = 1.0 - math.exp(-(block_size / sample_rate) / (self.energy_attack_ms / 1000.0))
+        self._release_alpha = 1.0 - math.exp(-(block_size / sample_rate) / (self.energy_release_ms / 1000.0))
+        self._burst_decay = math.exp(-(block_size / sample_rate) / (self.energy_burst_decay_ms / 1000.0))
+
     def _apply_phase_baseline(self, levels: dict[str, float]) -> dict[str, float]:
         """Apply phase-based baseline floors to energy levels."""
         result = dict(levels)
@@ -118,6 +130,47 @@ class VoiceModule(nn.Module):
         if self.state.phase_memory:
             result["memory"] = max(result.get("memory", 0.0), PHASE_BASELINE)
         return result
+
+    def _apply_energy_dynamics(self, levels: dict[str, float]) -> dict[str, float]:
+        """Smooth energy levels toward target and apply burst."""
+        result = {}
+        for k in ENERGY_NAMES:
+            target = levels.get(k, 0.0)
+            current = self._energy_smooth[k]
+            alpha = self._attack_alpha if target > current else self._release_alpha
+            smoothed = current + alpha * (target - current)
+            result[k] = max(0.0, min(1.0, smoothed + self._burst_energy[k]))
+            self._energy_smooth[k] = smoothed
+            # Decay burst
+            self._burst_energy[k] *= self._burst_decay
+        return result
+
+    def inject_burst(self, target_levels: dict[str, float] | None = None):
+        """Inject a per-note energy burst based on target levels or accumulation history.
+
+        If target_levels provided, uses those (current performance intent).
+        Otherwise falls back to normalized energy_accumulation (developmental history).
+        """
+        if target_levels is not None:
+            for k in ENERGY_NAMES:
+                self._burst_energy[k] += target_levels.get(k, 0.0) * self.energy_burst_factor
+                self._burst_energy[k] = min(self._burst_energy[k], 1.0)
+        else:
+            for k in ENERGY_NAMES:
+                accum_norm = min(1.0, self.state.energy_accumulation[k] / 10.0)
+                self._burst_energy[k] += accum_norm * self.energy_burst_factor
+                self._burst_energy[k] = min(self._burst_energy[k], 1.0)
+
+    def apply_energy_crosstalk(self, source_levels: dict[str, float], proximity: float):
+        """Leak energy from another Voice into this one's smoothed levels.
+
+        Args:
+            source_levels: smoothed energy levels from the source Voice
+            proximity: 0.0-1.0 frequency proximity (1.0 = same pitch)
+        """
+        for k in ENERGY_NAMES:
+            leak = source_levels.get(k, 0.0) * proximity * 0.1  # 10% base × proximity
+            self._energy_smooth[k] = min(1.0, self._energy_smooth[k] + leak)
 
     def _check_phase_transitions(self):
         """Check and apply irreversible phase transitions based on accumulation."""
@@ -189,8 +242,9 @@ class VoiceModule(nn.Module):
         device = next(self.decoder.parameters()).device
 
         with torch.no_grad():
-            # Apply phase baseline to effective levels
-            effective_levels = self._apply_phase_baseline(levels)
+            # Phase baseline → target; energy dynamics → effective
+            target_levels = self._apply_phase_baseline(levels)
+            effective_levels = self._apply_energy_dynamics(target_levels)
 
             # Accumulate energy
             for k in ENERGY_NAMES:
@@ -279,10 +333,12 @@ class VoiceModule(nn.Module):
         self.energy_gain = max(0.0, min(10.0, gain))
 
     def reset(self):
-        """Reset GRU hidden state, energy module state buffers, and noise generator."""
+        """Reset GRU hidden state, energy module state buffers, noise generator, and dynamics."""
         self._gru_hidden = None
         self.energy_module.reset_state()
         self._noise_gen.manual_seed(self.voice_id + 1)
+        self._energy_smooth = {k: 0.0 for k in ENERGY_NAMES}
+        self._burst_energy = {k: 0.0 for k in ENERGY_NAMES}
 
     def reset_full(self):
         """Full reset including developmental state (destructive)."""
@@ -294,4 +350,4 @@ class VoiceModule(nn.Module):
         self.state.active_note = midi_note
         if midi_note is not None:
             self.state.active_loudness = loudness_db
-            self.reset()  # fresh start for new note
+            self.reset()  # fresh start for new note (clears GRU, smooth, burst)

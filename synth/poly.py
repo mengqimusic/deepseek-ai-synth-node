@@ -127,6 +127,7 @@ class PolyphonicSynth(nn.Module):
         """Trigger a note. Returns the assigned voice_id."""
         voice_id = self.allocator.allocate(midi_note)
         self.voices[voice_id].set_note(midi_note, loudness_db)
+        self.voices[voice_id].inject_burst(self._energy_levels[voice_id])
         return voice_id
 
     def note_off(self, midi_note: int) -> int | None:
@@ -185,6 +186,29 @@ class PolyphonicSynth(nn.Module):
         """
         active_voices = self.allocator.active_voices()
         active_notes = dict(self.allocator._active_notes)  # snapshot
+
+        # Step 0: energy crosstalk between active Voices
+        if len(active_voices) >= 2:
+            active_list = sorted(active_voices)
+            for i, vid_a in enumerate(active_list):
+                for vid_b in active_list[i + 1:]:
+                    note_a = None
+                    note_b = None
+                    for midi, v in active_notes.items():
+                        if v == vid_a:
+                            note_a = midi
+                        elif v == vid_b:
+                            note_b = midi
+                    if note_a is not None and note_b is not None:
+                        f0_a = midi_to_hz(note_a)
+                        f0_b = midi_to_hz(note_b)
+                        semitone_dist = abs(note_a - note_b)
+                        proximity = max(0.0, 1.0 - semitone_dist / 24.0)  # 0 at 2 octaves
+                        if proximity > 0.01:
+                            voice_a = self.voices[vid_a]
+                            voice_b = self.voices[vid_b]
+                            voice_a.apply_energy_crosstalk(voice_b._energy_smooth, proximity)
+                            voice_b.apply_energy_crosstalk(voice_a._energy_smooth, proximity)
 
         # Step 1: get biased params from each Voice
         voice_params = []
