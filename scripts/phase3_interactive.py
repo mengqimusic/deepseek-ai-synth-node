@@ -22,6 +22,7 @@ Requires: sounddevice (pip install sounddevice)
 
 import argparse
 import math
+import queue
 import sys
 import threading
 import time
@@ -42,43 +43,79 @@ from synth.dsp.processors import midi_to_hz
 ENERGY_LABELS = {"tension": "张", "turbulence": "扰", "resonance": "吟", "memory": "忆"}
 ENERGY_KEYS = {"tension": "q", "turbulence": "w", "resonance": "e", "memory": "r"}
 
+AUDIO_QUEUE_DEPTH = 64  # ~256ms buffer at 4ms frame
+
 # ---------------------------------------------------------------------------
-# Shared state
+# Shared state (main thread writes, inference thread reads)
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
 _running = True
 _selected_voice = 0  # 0-4
-_voice_pitch = [67, 67, 67, 67, 67]  # MIDI per Voice, default G4
+_voice_pitch = [67, 67, 67, 67, 67]
 _voice_loudness = [-10.0, -10.0, -10.0, -10.0, -10.0]
-_voice_energy_toggle = [{k: 0.0 for k in ENERGY_NAMES} for _ in range(5)]  # user intent
-_voice_energy_smooth = [{k: 0.0 for k in ENERGY_NAMES} for _ in range(5)]  # smoothed
-_voice_trigger = [False] * 5  # note-on request from main thread
+_voice_energy_toggle = [{k: 0.0 for k in ENERGY_NAMES} for _ in range(5)]
+_voice_energy_smooth = [{k: 0.0 for k in ENERGY_NAMES} for _ in range(5)]
+_voice_trigger = [False] * 5
+
+# Stats (inference thread writes, main thread reads)
+_underrun_count = 0
+_overrun_count = 0
 
 
-def audio_callback_factory(synth: PolyphonicSynth, block_size: int):
-    """Return a sounddevice callback for the PolyphonicSynth."""
+def inference_loop(synth: PolyphonicSynth, audio_queue: queue.Queue, block_size: int):
+    """
+    Background thread: run process_frame() in a tight loop, push to queue.
+    This decouples inference timing from the audio callback deadline —
+    if inference is slower than real-time the queue drains gracefully
+    (callback repeats last frame); if faster, the queue fills and put() blocks.
+    """
+    global _underrun_count, _overrun_count
+
+    while _running:
+        # Apply note triggers and energy levels under lock
+        with _lock:
+            for vid in range(5):
+                if _voice_trigger[vid]:
+                    synth.note_on(_voice_pitch[vid], _voice_loudness[vid])
+                    _voice_trigger[vid] = False
+            for vid in range(5):
+                synth.set_all_energy(vid, _voice_energy_smooth[vid])
+
+        audio = synth.process_frame()
+
+        try:
+            audio_queue.put(audio, timeout=0.1)
+        except queue.Full:
+            _overrun_count += 1
+            # Drop oldest to make room (queue is full → inference is ahead)
+            try:
+                audio_queue.get_nowait()
+                audio_queue.put_nowait(audio)
+            except queue.Empty:
+                pass
+
+
+def audio_callback_factory(audio_queue: queue.Queue, block_size: int):
+    """Return a sounddevice callback that reads pre-computed audio from queue."""
+
+    last_chunk = np.zeros(block_size, dtype=np.float32)
 
     def callback(outdata, frames, _time, status):
         if status:
             print(f"audio status: {status}", file=sys.stderr)
 
-        global _voice_trigger, _voice_pitch, _voice_loudness
-
-        with _lock:
-            # Process note triggers from main thread
-            for vid in range(5):
-                if _voice_trigger[vid]:
-                    synth.note_on(_voice_pitch[vid], _voice_loudness[vid])
-                    _voice_trigger[vid] = False
-
-            # Apply energy levels
-            for vid in range(5):
-                synth.set_all_energy(vid, _voice_energy_smooth[vid])
+        global _underrun_count
 
         offset = 0
         remaining = frames
         while remaining > 0:
-            chunk = synth.process_frame()
+            try:
+                chunk = audio_queue.get_nowait()
+                last_chunk = chunk
+            except queue.Empty:
+                chunk = last_chunk
+                _underrun_count += 1
+
             n = min(block_size, remaining)
             outdata[offset : offset + n, 0] = chunk[:n]
             offset += n
@@ -110,8 +147,9 @@ def _midi_name(midi: int) -> str:
 def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int):
     import curses
 
-    global _selected_voice, _voice_pitch, _voice_loudness
+    global _selected_voice, _voice_pitch, _voice_loudness, _running
     global _voice_energy_toggle, _voice_energy_smooth, _voice_trigger
+    global _underrun_count, _overrun_count
 
     stdscr = curses.initscr()
     curses.noecho()
@@ -125,11 +163,24 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int):
     attack_alpha = 1.0 - math.exp(-0.004 / 0.030)
     release_alpha = 1.0 - math.exp(-0.004 / 0.150)
 
+    # Audio queue + inference thread (decoupled from callback deadline)
+    audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_DEPTH)
+    infer_thread = threading.Thread(
+        target=inference_loop,
+        args=(synth, audio_queue, block_size),
+        daemon=True,
+    )
+    infer_thread.start()
+
+    # Pre-fill a few frames so the callback doesn't underrun on start
+    for _ in range(8):
+        audio_queue.put(synth.process_frame())
+
     stream = sd.OutputStream(
         samplerate=sample_rate,
         blocksize=block_size * 8,
         channels=1,
-        callback=audio_callback_factory(synth, block_size),
+        callback=audio_callback_factory(audio_queue, block_size),
         dtype=np.float32,
     )
 
@@ -281,7 +332,13 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int):
                     stdscr.addstr(row, 2, wd_str)
 
                 # Controls
-                row = h - 6
+                row = h - 7
+                # Queue health
+                qsz = audio_queue.qsize()
+                qbar = _bar(min(qsz / AUDIO_QUEUE_DEPTH, 1.0), 20)
+                health = "OK" if _underrun_count == 0 else f"UNDERRUN x{_underrun_count}"
+                stdscr.addstr(row, 2, f"Queue: [{qbar}] {qsz}/{AUDIO_QUEUE_DEPTH}  {health}")
+                row += 1
                 stdscr.addstr(row, 2, "─" * min(78, w - 4))
                 row += 1
                 stdscr.addstr(row, 2, "1-5:select Voice  qwer:toggle energy  Space:note on  z:release voice  a:all off  x:reset  Esc:quit")
@@ -301,12 +358,16 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int):
             time.sleep(0.004)
 
     finally:
+        _running = False
+        infer_thread.join(timeout=1.0)
         stream.stop()
         stream.close()
         curses.nocbreak()
         stdscr.keypad(False)
         curses.echo()
         curses.endwin()
+        if _underrun_count or _overrun_count:
+            print(f"Audio stats: {_underrun_count} underruns, {_overrun_count} overruns")
 
 
 # ---------------------------------------------------------------------------
