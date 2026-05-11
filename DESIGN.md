@@ -389,6 +389,59 @@
 
 **A/B 监听文件**：`outputs/phase2/ab/{tension,turbulence,resonance,memory}_ab.wav`
 
+### 9.6 诊断 — 音色可调范围窄的根因 (2026-05-11)
+
+Phase 1+2 完成后，实际演奏测试发现声音可调范围非常窄。这不是参数调试问题，是**结构性瓶颈**，有三层根因：
+
+**第一层：训练数据只有一种音色。** 135 个片段全部来自 `scripts/generate_data.py` 中的单一长笛谐波模型——同一个 `1/h` 衰减 + `even_odd_ratio=0.7` 公式生成。Decoder 学到的 `(f0, loudness) → 谐波结构` 映射被困在一个"长笛流形"上。无论输入什么 f0/loudness，输出永远是长笛。
+
+**第二层：Decoder 输入空间只有 2 维。** 当前架构跳过了 learned encoder，输入只有 `[f0_scaled, loudness]` 两个标量。标准 DDSP autoencoder 有 `encoder → z → decoder`，z 是一个高维 latent 向量可以编码丰富的音色信息。2 维输入意味着模型根本没有表达"不同音色"的通道——f0 和 loudness 的变化只能改变音高和响度，不能改变音色本体。
+
+**第三层：能量偏置是后处理，不是生成。** Phase 2 的四个能量方向（张/扰/吟/忆）全部在 decoder 输出上做确定性信号处理。它们可以锐化、调制、扫频、混合一个已有的谐波结构，但不能生成一个不同性质的谐波结构。后处理的原材料永远是一个长笛。
+
+**为什么后续的 hypernetwork 阶段不能自动解决这个问题：** Hypernetwork 做 `energy → ΔW`，在权重空间中导航。但如果 decoder 只在长笛数据上训练过，它的权重空间就是一个"长笛流形"——hypernetwork 走到哪，产出的都是长笛的变形。要让 hypernetwork 的导航有足够大的疆域，**decoder 需要先在多样化的音色数据上训练**。这是 hypernetwork 阶段的前提条件，不是它能绕过去的。
+
+**对训练数据策略的影响：** 开放问题 #7（训练数据策略）需要从"合成数据可行"更新为"需要多音色训练数据，覆盖不同乐器类别、不同谐波结构模型"。这是下一阶段工作的前置依赖。
+
+### 9.7 Phase 3 完成 — 多 Voice 独立发育与频谱竞争 (2026-05-11)
+
+**架构**：1 个共享 DDSPDecoder + 5 个独立 VoiceModule + SpectralCompetitionScheduler + VoiceAllocator (round-robin)
+
+**VoiceModule** (`synth/voice.py`)：
+- 每个 Voice 持有独立 GRU hidden state、EnergyBiasModule 实例、VoiceState
+- VoiceState 包含：四方向能量积累（累计秒数）、不可逆相变标记、竞争权重、退让风格（3 频段增益因子）
+- 两步推理接口：`process_params()` → competition → `synthesize_from()`
+- 相变后自动叠加 phase baseline（floor=0.08）到对应方向
+
+**能量积累**：
+- 公式：`accum[direction] += effective_level * frame_duration`（frame_duration = 4ms）
+- 能量注入与音符触发解耦——Voice 静音时也积累能量
+- 相变阈值：每方向 5.0s 累积（level=1.0 等效）
+
+**竞争权重推导**：`weight = 1.0 + total_accum * 0.1 + phase_count * 0.3`
+
+**退让风格**：由四方向积累比例混合计算，张主导→让出中频少（0.30），扰主导→让出中频多（0.70），吟主导→让出高频多（0.70）、让出低频少（0.30），忆主导→均匀（0.50）
+
+**SpectralCompetitionScheduler** (`synth/competition.py`)：
+- 最简可用版本：在谐波振幅域（非音频域）调度，避免 FFT 开销和 artifacts
+- 3 频段分界：low <500Hz, mid 500-2000Hz, high >2000Hz
+- 每频段总能量超阈值（0.5）时，按竞争权重分配资源
+- 超额的 Voice 按退让风格承受差异化软增益衰减（最低 0.3×）
+
+**Voice Allocation**：循环分配（round-robin），不绑音高。新音符总是分配给下一个 Voice。
+
+**离线渲染验证** (`scripts/phase3_render_demos.py`)：
+- `independent_voices.wav` — 5 Voice 各自不同能量方向培育，36s，验证发育差异化
+- `spectral_competition.wav` — 3 Voice 同音高竞争 + 八度分散对比 + 能量注入竞争，18s
+- `phase_transition.wav` — 单 Voice 持续注入张能量→相变，12s
+- 确定性验证：torch.manual_seed(42) 后逐位相同
+
+**交互式测试** (`scripts/phase3_interactive.py`)：
+- 多 Voice 选择（1-5），每 Voice 独立能量注入（qwer），音符触发（Space），音高/响度调节
+- TUI 显示 5 Voice 状态矩阵：能量积累、相变标记、竞争权重、退让风格、活跃音符
+
+**代码位置**：`synth/voice.py`, `synth/competition.py`, `synth/poly.py`, `scripts/phase3_*.py`
+
 ---
 
 ## 10. 开放问题
@@ -396,12 +449,12 @@
 以下问题留在后续阶段（探索/原型/实现）解决：
 
 1. 四个能量方向的具体数量是否最优？原型阶段验证后可能增删
-2. Voice allocation 策略（循环 / LRU / 音高亲和度）
-3. 相变的具体阈值和方向间的相互作用——需要在实际系统中试出
+2. Voice allocation 策略（循环 / LRU / 音高亲和度）→ **Phase 3 已实现：循环分配（round-robin）**
+3. 相变的具体阈值和方向间的相互作用——需要在实际系统中试出 → **Phase 3 已实现：5.0s 阈值，不可逆 baseline floor=0.08**
 4. 神经网络具体架构选型（RAVE / DDSP / SNN / 其他）→ **已解决：DDSP + Hypernetwork，详见 NEURAL_ARCHITECTURE_SURVEY.md**
 5. 传统合成 fallback 的切换粒度和条件
 6. 快捷键唤起的具体交互设计
-7. 训练数据策略和训练流程 → **Phase 1 已验证：合成数据 + f0/loudness 预处理，小数据集可行**
+7. 训练数据策略和训练流程 → **Phase 1 已验证小数据集可行，但音色多样性是瓶颈（详见 9.6 诊断）。需要多音色训练数据——至少涵盖弦乐/铜管/人声/电子等不同谐波结构类别，否则 decoder 权重空间太窄，后续 hypernetwork 阶段导航范围受限**
 8. 是否支持多于 5 个 Voice（可扩展性）
 9. 物理形态的最终选择（Eurorack / 桌面 / 软件）
 
