@@ -23,6 +23,23 @@ from synth.dsp.noise import FilteredNoiseSynth
 from synth.voice import VoiceModule, VoiceState, ENERGY_NAMES
 from synth.competition import SpectralCompetitionScheduler
 
+# Harmonic overlap proximity per semitone interval (1% tolerance, H=20 harmonics)
+# Consonant intervals (octave/fifth) → higher coupling; dissonant (tritone) → low.
+_HARMONIC_PROXIMITY = {
+    0: 1.00,   # Unison
+    1: 0.25,   # Minor 2nd
+    2: 0.20,   # Major 2nd
+    3: 0.25,   # Minor 3rd
+    4: 0.25,   # Major 3rd
+    5: 0.25,   # Perfect 4th
+    6: 0.05,   # Tritone
+    7: 0.30,   # Perfect 5th
+    8: 0.15,   # Minor 6th
+    9: 0.20,   # Major 6th
+    10: 0.05,  # Minor 7th
+    11: 0.15,  # Major 7th
+}
+
 
 class VoiceAllocator:
     """Round-robin Voice allocation. Not bound to pitch."""
@@ -200,10 +217,12 @@ class PolyphonicSynth(nn.Module):
                         elif v == vid_b:
                             note_b = midi
                     if note_a is not None and note_b is not None:
-                        f0_a = midi_to_hz(note_a)
-                        f0_b = midi_to_hz(note_b)
                         semitone_dist = abs(note_a - note_b)
-                        proximity = max(0.0, 1.0 - semitone_dist / 24.0)  # 0 at 2 octaves
+                        octave_shift = semitone_dist // 12
+                        semitone_mod = semitone_dist % 12
+                        # Harmonic overlap lookup (1% tolerance, H=20)
+                        base_proximity = _HARMONIC_PROXIMITY.get(semitone_mod, 0.1)
+                        proximity = base_proximity * (0.7 ** octave_shift)
                         if proximity > 0.01:
                             voice_a = self.voices[vid_a]
                             voice_b = self.voices[vid_b]
