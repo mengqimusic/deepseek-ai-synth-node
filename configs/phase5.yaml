@@ -1,0 +1,29 @@
+data:
+  data_dir: "data/multitimbral_processed"
+  sample_rate: 16000
+  hop_size: 64
+  block_size: 64
+
+model:
+  hidden_size: 180
+  n_harmonics: 100
+  n_magnitudes: 65
+  bottleneck: 48
+  max_scale: 0.12
+  base_checkpoint: "checkpoints/phase1_final.pt"
+
+# Fixed energy → timbre class mapping (matching design intent)
+energy_mapping:
+  string:     [0.8, 0.1, 0.3, 0.2]
+  brass:      [0.2, 0.8, 0.1, 0.1]
+  voice:      [0.1, 0.2, 0.8, 0.3]
+  electronic: [0.3, 0.4, 0.2, 0.8]
+
+training:
+  batch_size: 8
+  learning_rate: 1.0e-3
+  total_steps: 2000
+  fft_sizes: [2048, 1024, 512, 256, 128]
+  log_interval: 100
+  ckpt_interval: 1000
+  val_steps: 20

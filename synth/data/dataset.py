@@ -9,11 +9,17 @@ class DDSPDataset(Dataset):
     Dataset of preprocessed DDSP training samples.
 
     Each sample is a tuple of (audio, f0, loudness) loaded from .npy files.
+
+    When return_class=True, also extracts the timbre class from the filename
+    (e.g., "brass_A2_f" → class="brass") and returns it as "timbre_class".
     """
 
-    def __init__(self, data_dir: str, split: str = "train"):
+    TIMBRE_CLASSES = ["string", "brass", "voice", "electronic"]
+
+    def __init__(self, data_dir: str, split: str = "train", return_class: bool = False):
         self.data_dir = Path(data_dir)
         self.split = split
+        self.return_class = return_class
         self.samples: list[dict] = []
         self._load_manifest()
 
@@ -28,14 +34,22 @@ class DDSPDataset(Dataset):
                     continue
                 parts = line.split(",")
                 name = parts[0]
-                self.samples.append(
-                    {
-                        "name": name,
-                        "audio_path": str(self.data_dir / f"{name}_audio.npy"),
-                        "f0_path": str(self.data_dir / f"{name}_f0.npy"),
-                        "loudness_path": str(self.data_dir / f"{name}_loudness.npy"),
-                    }
-                )
+                sample = {
+                    "name": name,
+                    "audio_path": str(self.data_dir / f"{name}_audio.npy"),
+                    "f0_path": str(self.data_dir / f"{name}_f0.npy"),
+                    "loudness_path": str(self.data_dir / f"{name}_loudness.npy"),
+                }
+                if self.return_class:
+                    sample["timbre_class"] = self._parse_class(name)
+                self.samples.append(sample)
+
+    @staticmethod
+    def _parse_class(name: str) -> str:
+        prefix = name.split("_")[0]
+        if prefix in DDSPDataset.TIMBRE_CLASSES:
+            return prefix
+        raise ValueError(f"Unknown timbre class in '{name}': expected one of {DDSPDataset.TIMBRE_CLASSES}")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -45,7 +59,10 @@ class DDSPDataset(Dataset):
         audio = torch.from_numpy(np.load(sample["audio_path"]))
         f0 = torch.from_numpy(np.load(sample["f0_path"]))
         loudness = torch.from_numpy(np.load(sample["loudness_path"]))
-        return {"audio": audio, "f0": f0, "loudness": loudness, "name": sample["name"]}
+        item = {"audio": audio, "f0": f0, "loudness": loudness, "name": sample["name"]}
+        if self.return_class:
+            item["timbre_class"] = sample["timbre_class"]
+        return item
 
 
 def collate_variable_length(batch: list[dict]) -> dict:
@@ -59,4 +76,9 @@ def collate_variable_length(batch: list[dict]) -> dict:
     f0 = torch.stack(f0_list)
     loudness = torch.stack(loudness_list)
 
-    return {"audio": audio, "f0": f0, "loudness": loudness, "name": names}
+    result = {"audio": audio, "f0": f0, "loudness": loudness, "name": names}
+
+    if "timbre_class" in batch[0]:
+        result["timbre_class"] = [b["timbre_class"] for b in batch]
+
+    return result
