@@ -45,12 +45,20 @@ class Trainer:
         if self.use_amp:
             with torch.cuda.amp.autocast():
                 pred = self.model(f0, loudness)
+                min_len = min(pred.shape[-1], target.shape[-1])
+                assert min_len > 0, f"Zero-length output (T={f0.shape[-1]})"
+                pred = pred[..., :min_len]
+                target = target[..., :min_len]
                 loss = self.loss_fn(pred, target)
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             pred = self.model(f0, loudness)
+            min_len = min(pred.shape[-1], target.shape[-1])
+            assert min_len > 0, f"Zero-length output (T={f0.shape[-1]})"
+            pred = pred[..., :min_len]
+            target = target[..., :min_len]
             loss = self.loss_fn(pred, target)
             loss.backward()
             self.optimizer.step()
@@ -69,6 +77,10 @@ class Trainer:
             loudness = batch["loudness"].to(self.device)
             target = batch["audio"].to(self.device)
             pred = self.model(f0, loudness)
+            min_len = min(pred.shape[-1], target.shape[-1])
+            assert min_len > 0, f"Zero-length output (T={f0.shape[-1]})"
+            pred = pred[..., :min_len]
+            target = target[..., :min_len]
             loss = self.loss_fn(pred, target)
             total_loss += loss.item()
             n += 1
