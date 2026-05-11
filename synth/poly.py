@@ -155,6 +155,16 @@ class PolyphonicSynth(nn.Module):
             for k in ENERGY_NAMES:
                 self._energy_levels[voice_id][k] = max(0.0, min(1.0, levels.get(k, 0.0)))
 
+    def set_energy_gain(self, voice_id: int, gain: float):
+        """Set hypernetwork energy gain for a specific Voice (1.0 = default)."""
+        if 0 <= voice_id < self.num_voices:
+            self.voices[voice_id].set_energy_gain(gain)
+
+    def set_all_energy_gain(self, gain: float):
+        """Set hypernetwork energy gain for all Voices."""
+        for voice in self.voices:
+            voice.set_energy_gain(gain)
+
     def get_energy(self, voice_id: int) -> dict[str, float]:
         if 0 <= voice_id < self.num_voices:
             return dict(self._energy_levels[voice_id])

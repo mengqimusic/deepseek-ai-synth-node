@@ -81,11 +81,13 @@ class VoiceModule(nn.Module):
         sample_rate: int = 16000,
         block_size: int = 64,
         modulated_decoder: nn.Module | None = None,  # shared ModulatedDecoder
+        energy_gain: float = 1.0,  # multiplier for hypernetwork energy input
     ):
         super().__init__()
         self.voice_id = voice_id
         self.decoder = decoder
         self.modulated_decoder = modulated_decoder
+        self.energy_gain = energy_gain
         self.harmonic_synth = harmonic_synth
         self.noise_synth = noise_synth
         self.block_size = block_size
@@ -211,7 +213,7 @@ class VoiceModule(nn.Module):
                     effective_levels["turbulence"],
                     effective_levels["resonance"],
                     effective_levels["memory"]
-                ]], device=device)
+                ]], device=device) * self.energy_gain
                 harm, noise, self._gru_hidden = self.modulated_decoder.forward_step(
                     f0_scaled, loudness, energy_tensor, self._gru_hidden
                 )
@@ -271,6 +273,10 @@ class VoiceModule(nn.Module):
         harm_out = harm.squeeze(0).squeeze(0)  # [n_harmonics]
         noise_out = noise.squeeze(0).squeeze(0)  # [n_magnitudes]
         return audio, harm_out, noise_out
+
+    def set_energy_gain(self, gain: float):
+        """Set hypernetwork energy gain multiplier (1.0 = default, 3.0-5.0 = aggressive)."""
+        self.energy_gain = max(0.0, min(10.0, gain))
 
     def reset(self):
         """Reset GRU hidden state, energy module state buffers, and noise generator."""
