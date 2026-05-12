@@ -19,7 +19,7 @@ class EnergyBiasModule(nn.Module):
 
     def __init__(
         self,
-        n_harmonics: int = 100,
+        n_harmonics: int = 256,
         n_magnitudes: int = 65,
         sample_rate: int = 16000,
         block_size: int = 64,

@@ -17,7 +17,7 @@ class WavetableHarmonicSynth(nn.Module):
 
     def __init__(
         self,
-        n_harmonics: int = 100,
+        n_harmonics: int = 256,
         table_size: int = 2048,
         sample_rate: int = 16000,
         block_size: int = 64,
@@ -62,15 +62,16 @@ class WavetableHarmonicSynth(nn.Module):
         beta: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
-        Additive synthesis with inharmonic frequency stretching.
+        Additive synthesis with per-harmonic inharmonic frequency stretching.
 
-        f_k = k × f0 × (1 + β × (k² - 1))
+        f_k = k × f0 × (1 + β_k × (k² - 1))
 
         Args:
             harmonic_amps: [B, T, n_harmonics]
             f0_hz:         [B, T]
             phase_start:   [B, n_harmonics] radian phases, or None
-            beta:          [B, T] inharmonicity coefficient ∈ [0, 0.01]
+            beta:          [B, T] or [B, T, n_harmonics] inharmonicity
+                           per-harmonic coefficients ∈ [-0.02, 0.02]
 
         Returns:
             audio: [B, T * block_size]
@@ -88,13 +89,20 @@ class WavetableHarmonicSynth(nn.Module):
         k = torch.arange(1, n_h + 1, device=device, dtype=dtype)  # [n_h]
         k_sq = k * k
 
-        # Inharmonic frequencies: f_k = k × f0 × (1 + β × (k² - 1))
+        # Inharmonic frequencies: f_k = k × f0 × (1 + β_k × (k² - 1))
         f0 = f0_hz.unsqueeze(-1)  # [B, T, 1]
         b = beta
         while b.dim() < 2:
             b = b.unsqueeze(0)
-        b = b.unsqueeze(-1)  # [B, T, 1]
-        inharm_factor = 1.0 + b * (k_sq - 1.0)  # [1, 1, n_h] broadcast
+        if b.dim() == 2:
+            # Per-frame scalar β [B, T]: broadcast to all harmonics
+            b = b.unsqueeze(-1)  # [B, T, 1]
+        elif b.shape[-1] == 1:
+            # Per-frame scalar already 3D [B, T, 1]: ready for broadcast
+            pass
+        # else: per-harm β [B, T, n_h]: use as-is
+        inharm_factor = 1.0 + b * (k_sq - 1.0)  # broadcast to [B, T, n_h]
+        inharm_factor = inharm_factor.clamp(min=0.01)  # prevent negative frequencies
         freqs = k * f0 * inharm_factor  # [B, T, n_h]
 
         # Phase increment per sample: 2π × f_k / sample_rate

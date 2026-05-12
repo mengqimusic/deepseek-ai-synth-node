@@ -1,9 +1,8 @@
 """
-Modulated DDSP decoder with hypernetwork-driven weight injection.
+Modulated decoders with hypernetwork-driven weight injection.
 
-Wraps a frozen DDSPDecoder and applies per-batch ΔW from a Hypernetwork
-based on energy state. The base decoder weights are never modified — ΔW
-is applied via temporary weight substitution during forward pass.
+Phase 5: ModulatedDecoder — wraps DDSPDecoder (harm_head + noise_head)
+Phase 10a: ModulatedRichDecoder — wraps RichParamDecoder (6 heads)
 """
 
 import torch
@@ -15,14 +14,11 @@ from synth.nn.hypernetwork import Hypernetwork
 
 class ModulatedDecoder(nn.Module):
     """
-    DDSPDecoder with hypernetwork-injected weight modulation.
+    DDSPDecoder with hypernetwork-injected weight modulation (Phase 5).
 
     Holds a frozen base DDSPDecoder + a trainable Hypernetwork.
     During forward(), computes ΔW from energy_state and temporarily
     layers it onto harm_head and noise_head weights.
-
-    The base decoder weights are NEVER modified in-place — we construct
-    effective weights on the fly using functional linear transforms.
     """
 
     def __init__(
@@ -55,20 +51,8 @@ class ModulatedDecoder(nn.Module):
         loudness: torch.Tensor,
         energy_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            f0_scaled:   [B, T] log-scaled f0
-            loudness:    [B, T] loudness in dB
-            energy_state: [B, 4] normalized energy accumulation
-
-        Returns:
-            harmonic_amps: [B, T, n_harmonics]
-            noise_mags:    [B, T, n_magnitudes]
-        """
-        # Compute ΔW from hypernetwork
         deltas = self.hypernetwork(energy_state)
 
-        # Run decoder up to post_mlp (shared backbone, no modulation needed here)
         x = torch.stack([f0_scaled, loudness], dim=-1)
         x = self.base.pre_mlp(x)
         x, _ = self.base.gru(x)
@@ -76,20 +60,13 @@ class ModulatedDecoder(nn.Module):
 
         B, T, H = x.shape
 
-        # Apply modulated harm_head: W_eff = W_base + ΔW
-        harm_W = self.base.harm_head.weight  # [n_harmonics, hidden_size]
-        harm_b = self.base.harm_head.bias    # [n_harmonics]
-        delta_W_h = deltas["delta_W_harm"]   # [B, n_harmonics, hidden_size]
-        delta_b_h = deltas["delta_b_harm"]   # [B, n_harmonics]
+        # Modulated harm_head
+        harm_W = self.base.harm_head.weight
+        harm_b = self.base.harm_head.bias
+        eff_harm_W = harm_W.unsqueeze(0) + deltas["delta_W_harm"]
+        eff_harm_b = harm_b.unsqueeze(0) + deltas["delta_b_harm"]
 
-        # Effective weights: [B, n_harmonics, hidden_size]
-        eff_harm_W = harm_W.unsqueeze(0) + delta_W_h
-        eff_harm_b = harm_b.unsqueeze(0) + delta_b_h
-
-        # Batched linear: x[b,t,:] @ eff_harm_W[b,:,:]^T + eff_harm_b[b,:]
-        x_flat = x.reshape(B * T, H)  # [B*T, hidden_size]
-
-        # Expand weights to match flattened batch
+        x_flat = x.reshape(B * T, H)
         eff_harm_W_flat = eff_harm_W.unsqueeze(1).expand(B, T, self.n_harmonics, H)
         eff_harm_W_flat = eff_harm_W_flat.reshape(B * T, self.n_harmonics, H)
         eff_harm_b_flat = eff_harm_b.unsqueeze(1).expand(B, T, self.n_harmonics)
@@ -101,14 +78,11 @@ class ModulatedDecoder(nn.Module):
         harm_out = harm_out.reshape(B, T, self.n_harmonics)
         harmonic_amps = torch.sigmoid(harm_out)
 
-        # Apply modulated noise_head
-        noise_W = self.base.noise_head.weight    # [n_magnitudes, hidden_size]
-        noise_b = self.base.noise_head.bias      # [n_magnitudes]
-        delta_W_n = deltas["delta_W_noise"]      # [B, n_magnitudes, hidden_size]
-        delta_b_n = deltas["delta_b_noise"]      # [B, n_magnitudes]
-
-        eff_noise_W = noise_W.unsqueeze(0) + delta_W_n
-        eff_noise_b = noise_b.unsqueeze(0) + delta_b_n
+        # Modulated noise_head
+        noise_W = self.base.noise_head.weight
+        noise_b = self.base.noise_head.bias
+        eff_noise_W = noise_W.unsqueeze(0) + deltas["delta_W_noise"]
+        eff_noise_b = noise_b.unsqueeze(0) + deltas["delta_b_noise"]
 
         eff_noise_W_flat = eff_noise_W.unsqueeze(1).expand(B, T, self.n_magnitudes, H)
         eff_noise_W_flat = eff_noise_W_flat.reshape(B * T, self.n_magnitudes, H)
@@ -131,34 +105,18 @@ class ModulatedDecoder(nn.Module):
         energy_state: torch.Tensor,
         gru_hidden: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Single-frame modulated forward with GRU state for real-time inference.
-
-        Args:
-            f0_scaled:   [1, 1] log-scaled f0
-            loudness:    [1, 1] loudness in dB
-            energy_state: [1, 4] normalized energy accumulation
-            gru_hidden:  [1, 1, hidden_size] or None (zeros for first frame)
-
-        Returns:
-            harmonic_amps: [1, 1, n_harmonics] — sigmoid'd
-            noise_mags:    [1, 1, n_magnitudes] — sigmoid'd
-            new_gru_hidden: [1, 1, hidden_size]
-        """
         deltas = self.hypernetwork(energy_state)
 
-        x = torch.stack([f0_scaled, loudness], dim=-1)  # [1, 1, 2]
-        x = self.base.pre_mlp(x)                        # [1, 1, H]
-        x, h = self.base.gru(x, gru_hidden)              # [1, 1, H], [1, 1, H]
-        x = self.base.post_mlp(x)                        # [1, 1, H]
+        x = torch.stack([f0_scaled, loudness], dim=-1)
+        x = self.base.pre_mlp(x)
+        x, h = self.base.gru(x, gru_hidden)
+        x = self.base.post_mlp(x)
 
-        # Modulated harm_head
         eff_harm_W = self.base.harm_head.weight.unsqueeze(0) + deltas["delta_W_harm"]
         eff_harm_b = self.base.harm_head.bias.unsqueeze(0) + deltas["delta_b_harm"]
         harm_out = torch.bmm(x, eff_harm_W.transpose(1, 2)) + eff_harm_b.unsqueeze(1)
         harmonic_amps = torch.sigmoid(harm_out)
 
-        # Modulated noise_head
         eff_noise_W = self.base.noise_head.weight.unsqueeze(0) + deltas["delta_W_noise"]
         eff_noise_b = self.base.noise_head.bias.unsqueeze(0) + deltas["delta_b_noise"]
         noise_out = torch.bmm(x, eff_noise_W.transpose(1, 2)) + eff_noise_b.unsqueeze(1)
@@ -172,7 +130,6 @@ class ModulatedDecoder(nn.Module):
         f0_scaled: torch.Tensor,
         loudness: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass with zero energy (no modulation)."""
         return self.base(f0_scaled, loudness)
 
     def count_parameters(self) -> dict[str, int]:
@@ -183,3 +140,154 @@ class ModulatedDecoder(nn.Module):
             "hypernetwork": hyper_params,
             "total": base_params + hyper_params,
         }
+
+
+class ModulatedRichDecoder(nn.Module):
+    """
+    RichParamDecoder with hypernetwork-injected weight modulation (Phase 10a).
+
+    Wraps a frozen RichParamDecoder and applies per-batch ΔW from a
+    HypernetworkV2. Generalized for 6 output heads with varying shapes
+    and activation functions.
+    """
+
+    def __init__(
+        self,
+        base_decoder: nn.Module,
+        hypernetwork: nn.Module | None = None,
+        frozen_decoder: bool = True,
+    ):
+        super().__init__()
+        self.base = base_decoder
+
+        if hypernetwork is None:
+            from synth.nn.hypernetwork import HypernetworkV2
+            hypernetwork = HypernetworkV2(
+                hidden_size=base_decoder.gru_hidden,
+            )
+        self.hypernetwork = hypernetwork
+
+        if frozen_decoder:
+            for p in self.base.parameters():
+                p.requires_grad_(False)
+
+        self._head_names = list(hypernetwork.head_specs.keys())
+
+    def forward(
+        self,
+        f0_scaled: torch.Tensor,
+        loudness: torch.Tensor,
+        energy_state: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        deltas = self.hypernetwork(energy_state)
+
+        x = torch.stack([f0_scaled, loudness], dim=-1)
+        x = self.base.pre_mlp(x)
+        if mask is None and x.shape[1] > 1:
+            mask = self.base._build_causal_mask(x.shape[1], x.device)
+        x = self.base.transformer(x, mask=mask)
+        x = self.base.proj_to_gru(x)
+        x, _ = self.base.gru(x)
+        x = self.base.post_mlp(x)
+        B, T, H = x.shape
+
+        outputs = {}
+        for name in self._head_names:
+            base_weight = getattr(self.base, f"{name}_head").weight
+            base_bias = getattr(self.base, f"{name}_head").bias
+            dW = deltas[f"delta_W_{name}"]
+            db = deltas[f"delta_b_{name}"]
+            out_dim = dW.shape[1]
+
+            x_flat = x.reshape(B * T, H)
+            eff_W = base_weight.unsqueeze(0) + dW
+            eff_W_flat = eff_W.unsqueeze(1).expand(B, T, out_dim, H).reshape(B * T, out_dim, H)
+            eff_b = base_bias.unsqueeze(0) + db
+            eff_b_flat = eff_b.unsqueeze(1).expand(B, T, out_dim).reshape(B * T, out_dim)
+
+            raw = torch.bmm(eff_W_flat, x_flat.unsqueeze(-1)).squeeze(-1) + eff_b_flat
+            raw = raw.reshape(B, T, out_dim)
+
+            if name == "inharm":
+                activated = torch.tanh(raw) * self.base.beta_max
+            else:
+                activated = torch.sigmoid(raw)
+            outputs[name] = activated
+
+        noise = outputs.pop("noise")
+        return {
+            "harm_amps": outputs["harm"],
+            "inharm_beta": outputs["inharm"],
+            "formant": outputs["formant"],
+            "transient": outputs["transient"],
+            "fm": outputs["fm"],
+            "noise_mel": noise[:, :, :self.base.n_noise_mel],
+            "noise_grain": noise[:, :, self.base.n_noise_mel:],
+        }
+
+    @torch.no_grad()
+    def forward_step(
+        self,
+        f0_scaled: torch.Tensor,
+        loudness: torch.Tensor,
+        energy_state: torch.Tensor,
+        xf_buffer: torch.Tensor | None = None,
+        gru_hidden: torch.Tensor | None = None,
+        max_context: int = 128,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        deltas = self.hypernetwork(energy_state)
+
+        x = torch.stack([f0_scaled, loudness], dim=-1)
+        x = self.base.pre_mlp(x)
+
+        if xf_buffer is None:
+            xf_buffer = x
+        else:
+            xf_buffer = torch.cat([xf_buffer, x], dim=1)
+            if xf_buffer.shape[1] > max_context:
+                xf_buffer = xf_buffer[:, -max_context:, :]
+
+        x_xf = self.base.transformer(xf_buffer, mask=None)
+        x_out = x_xf[:, -1:, :]
+        x_out = self.base.proj_to_gru(x_out)
+        x_out, gru_hidden = self.base.gru(x_out, gru_hidden)
+        x_out = self.base.post_mlp(x_out)
+
+        outputs = {}
+        for name in self._head_names:
+            base_weight = getattr(self.base, f"{name}_head").weight
+            base_bias = getattr(self.base, f"{name}_head").bias
+            dW = deltas[f"delta_W_{name}"]
+            db = deltas[f"delta_b_{name}"]
+
+            eff_W = base_weight.unsqueeze(0) + dW
+            eff_b = base_bias.unsqueeze(0) + db
+            raw = torch.bmm(x_out, eff_W.transpose(1, 2)) + eff_b.unsqueeze(1)
+
+            if name == "inharm":
+                activated = torch.tanh(raw) * self.base.beta_max
+            else:
+                activated = torch.sigmoid(raw)
+            outputs[name] = activated
+
+        noise = outputs.pop("noise")
+        result = {
+            "harm_amps": outputs["harm"],
+            "inharm_beta": outputs["inharm"],
+            "formant": outputs["formant"],
+            "transient": outputs["transient"],
+            "fm": outputs["fm"],
+            "noise_mel": noise[:, :, :self.base.n_noise_mel],
+            "noise_grain": noise[:, :, self.base.n_noise_mel:],
+        }
+        return result, xf_buffer, gru_hidden.detach()
+
+    @torch.no_grad()
+    def forward_neutral(
+        self,
+        f0_scaled: torch.Tensor,
+        loudness: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        return self.base(f0_scaled, loudness, mask=mask)

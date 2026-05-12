@@ -16,10 +16,13 @@ import torch.nn as nn
 
 from synth.dsp.processors import midi_to_hz
 from synth.nn.decoder import DDSPDecoder
-from synth.nn.hypernetwork import Hypernetwork
-from synth.nn.modulated_decoder import ModulatedDecoder
+from synth.nn.hypernetwork import Hypernetwork, HypernetworkV2
+from synth.nn.modulated_decoder import ModulatedDecoder, ModulatedRichDecoder
+from synth.nn.transformer_decoder import RichParamDecoder
 from synth.dsp.harmonic import WavetableHarmonicSynth
-from synth.dsp.noise import FilteredNoiseSynth
+from synth.dsp.noise import FilteredNoiseSynth, GrainNoiseSynth
+from synth.dsp.fm import FMSynth
+from synth.dsp.transient import TransientCombNoise
 from synth.voice import VoiceModule, VoiceState, ENERGY_NAMES
 from synth.competition import SpectralCompetitionScheduler
 from synth.feedback import FeedbackCoupler
@@ -99,14 +102,36 @@ class PolyphonicSynth(nn.Module):
         sample_rate: int = 16000,
         block_size: int = 64,
         hypernetwork: Hypernetwork | None = None,
+        rich_mode: bool = False,
+        hypernetwork_v2: HypernetworkV2 | None = None,
+        fm_synth: FMSynth | None = None,
+        grain_synth: GrainNoiseSynth | None = None,
+        transient_synth: TransientCombNoise | None = None,
     ):
         super().__init__()
         self.num_voices = num_voices
         self.block_size = block_size
         self.sample_rate = sample_rate
+        self.rich_mode = rich_mode
 
-        # Create modulated decoder if hypernetwork is available
-        if hypernetwork is not None:
+        if rich_mode:
+            if hasattr(decoder, 'n_harmonics'):
+                n_harmonics = decoder.n_harmonics
+            if hasattr(decoder, 'n_noise_mel'):
+                n_magnitudes = decoder.n_noise_mel
+
+        if rich_mode:
+            # RichParamDecoder path
+            if hypernetwork_v2 is not None:
+                modulated_decoder = ModulatedRichDecoder(
+                    base_decoder=decoder,
+                    hypernetwork=hypernetwork_v2,
+                    frozen_decoder=True,
+                )
+            else:
+                modulated_decoder = None
+        elif hypernetwork is not None:
+            # Legacy modulated decoder
             modulated_decoder = ModulatedDecoder(
                 base_decoder=decoder,
                 hypernetwork=hypernetwork,
@@ -126,6 +151,10 @@ class PolyphonicSynth(nn.Module):
                 sample_rate=sample_rate,
                 block_size=block_size,
                 modulated_decoder=modulated_decoder,
+                rich_mode=rich_mode,
+                fm_synth=fm_synth,
+                grain_synth=grain_synth,
+                transient_synth=transient_synth,
             )
             for i in range(num_voices)
         ])
@@ -333,7 +362,7 @@ class PolyphonicSynth(nn.Module):
                     loudness_db=-40.0,
                     levels=levels,
                 )
-                param_list.append({
+                silent_params = {
                     "voice_id": voice_id,
                     "harm_amps": torch.zeros(1, 1, voice.energy_module.n_harmonics),
                     "noise_mags": torch.zeros(1, 1, voice.energy_module.n_magnitudes),
@@ -343,7 +372,8 @@ class PolyphonicSynth(nn.Module):
                     "withdrawal_mid": voice.state.withdrawal_mid,
                     "withdrawal_high": voice.state.withdrawal_high,
                     "is_active": False,
-                })
+                }
+                param_list.append(silent_params)
                 voice_audio[voice_id] = np.zeros(self.block_size, dtype=np.float32)
                 continue
 
@@ -351,19 +381,9 @@ class PolyphonicSynth(nn.Module):
             loudness = self._voice_loudness[voice_id]
             levels = self._energy_levels[voice_id]
 
-            harm, noise, _f0_tensor = voice.process_params(f0_hz, loudness, levels)
+            vp = voice.process_params(f0_hz, loudness, levels)
+            vp["voice_id"] = voice_id
 
-            vp = {
-                "voice_id": voice_id,
-                "harm_amps": harm,
-                "noise_mags": noise,
-                "f0_hz": f0_hz,
-                "competition_weight": voice.state.competition_weight,
-                "withdrawal_low": voice.state.withdrawal_low,
-                "withdrawal_mid": voice.state.withdrawal_mid,
-                "withdrawal_high": voice.state.withdrawal_high,
-                "is_active": True,
-            }
             param_list.append(vp)
             voice_params.append(vp)
 
@@ -375,10 +395,7 @@ class PolyphonicSynth(nn.Module):
         for vp in param_list:
             vid = vp["voice_id"]
             if vp.get("is_active", False):
-                f0_tensor = torch.tensor([[vp["f0_hz"]]], device=vp["harm_amps"].device)
-                audio = self.voices[vid].synthesize_from(
-                    vp["harm_amps"], vp["noise_mags"], f0_tensor
-                )
+                audio = self.voices[vid].synthesize_from(vp)
                 mixed += audio
             else:
                 mixed += voice_audio.get(vid, np.zeros(self.block_size, dtype=np.float32))
