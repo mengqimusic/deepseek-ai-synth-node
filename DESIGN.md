@@ -647,28 +647,103 @@ P3+P4+P5 留到后续 Phase。
 
 ## 12. 硬件规划：开发板选型 + 复音数优化
 
-*待进入独立分析 Phase，本节为方向性框架*
+*分析日期: 2026-05-12, 基于实际算力需求评估*
 
-### 12.1 分析的维度
+### 12.1 算力需求评估
 
-1. **算力约束**：当前 RTF 0.048 (Phase 1 DDSP baseline, Mac CPU)，但完整 5-Voice + hypernetwork + feedback + energy bias 的实测 RTF 待测量
-2. **内存约束**：5 个独立 Voice 的 GRU state + hypernetwork 权重 + delay buffer (memory) 需多大数据带宽
-3. **I/O 约束**：30 推杆 (ADC 通道) + 音频输出 (DAC) + 可能的 MIDI 输入
-4. **实时性约束**：4ms frame deadline (250Hz)，不能丢帧
-5. **人因约束**：30 推杆是否稀释演奏者注意力？3-4 个复音是否更科学？
+当前模型（258K params, 5 Voice, 250Hz frame rate）：
 
-### 12.2 候选平台方向
+```
+单 Voice 单帧: ~360,000 MAC
+5 Voice total:  0.45 GMAC/s ≈ 0.9 GOPS (float32) ≈ <0.001 TOPS (int8)
+完整 5-Voice + hypernetwork + feedback RTF 估计: 0.3-0.5
+```
 
-| 平台 | 算力 | 成本 | 适合度 |
-|------|------|------|--------|
-| Raspberry Pi 5 | 中 (ARM A76) | 低 | 可能跑 3-4 Voice |
-| Teensy 4.1 | 低 (ARM M7) | 极低 | 需轻量化模型，1-2 Voice |
-| Bela (BeagleBone + Xenomai) | 中 | 中 | 低延迟音频专用，适合原型 |
-| Jetson Nano/Orin | 高 (GPU) | 中-高 | 可跑全模型 |
-| STM32H7 | 极低 | 极低 | 需极简模型或纯 DSP fallback |
-| Mac/PC + MIDI 控制器 | 最高 | 高 | 最快验证交互设计 |
+RPi 5 (4×A76 @2.4GHz ≈ 80 GFLOPS CPU) 可以跑 50M 参数的模型。但实际瓶颈不是 TOPS，是帧时间：
 
-### 12.3 复音数优化
+### 12.2 延迟墙分析
+
+```
+40 TOPS × 0.004s = 160 Giga-ops/frame (理论)
+                   ÷ 5 Voice = 32 Giga-ops/Voice
+
+50M param Transformer decoder 每帧: ~0.2 Giga-ops
+剩余 31.8 Giga-ops 在 4ms 窗口内调度不进来。
+```
+
+GRU 的循环依赖 + 层间顺序依赖 → 单帧推理可并行的只有矩阵乘法。**算力再多也无法突破帧延迟墙。** 实时音频合成的真实瓶颈不在 TOPS，在帧时间。
+
+4ms 是实时演奏和模型容量的平衡点（低于 8ms 人感知不到延迟，高于 2ms 模型容量被压缩）。如果将来需要更大模型，方案是双速率架构（慢通路 16ms 做深层 embedding，快通路 4ms 做逐帧平滑），不是降帧率。
+
+### 12.3 选定平台
+
+*以下价格为 2026 年 5 月淘宝/京东实际零售价。2026 DRAM 危机导致树莓派 16GB 从 $120 涨至 $305 (+154%)，推荐已调整。*
+
+#### 开发阶段：继续用 Mac，不急买板
+
+当前项目处于原型迭代期——模型架构、交互逻辑、音色设计都在频繁变化。嵌入式部署的价值在模型稳定后才体现。现在买板 = 多一个需要维护的环境。
+
+#### 独立设备阶段两个推荐路线
+
+**路线 1：x86 直通（推荐）— Radxa X4 8GB**
+
+| 维度 | 参数 |
+|------|------|
+| CPU | Intel N100 (4C/4T, x86_64) |
+| RAM | 8GB LPDDR5 |
+| 算力 | ~200 GFLOPS (CPU), Intel OpenVINO 可选加速 |
+| PyTorch | 原生运行，和 Mac 开发环境同架构，零转换 |
+| 音频 I/O | USB 声卡 |
+| 价格 | ¥700-1,000 |
+| 缺点 | 功耗较高 (~15W)，需主动散热 |
+
+**路线 2：ARM + NPU — Orange Pi 5 Plus 16GB**
+
+| 维度 | 参数 |
+|------|------|
+| SoC | RK3588 (4×A76 + 4×A55) |
+| RAM | 16GB LPDDR4X |
+| NPU | 6 TOPS (int8) |
+| PyTorch | 需 ONNX → RKNN 转换（开发期增加一步） |
+| 音频 I/O | USB 声卡 |
+| 价格 | ¥800-950 |
+| 优点 | 16GB RAM 充裕，NPU 可离线加速大模型推理 |
+| 风险 | RKNN 工具链转换复杂模型时有未知坑 |
+
+**路线 3（预算充足）：Jetson Orin Nano Super 8GB**
+
+| 维度 | 参数 |
+|------|------|
+| GPU | 1024 CUDA + 32 Tensor Cores |
+| 算力 | 67 TOPS (int8) |
+| PyTorch | 原生 CUDA，和 Mac 开发体验一致 |
+| 价格 | ¥2,800-3,700 |
+| 评价 | 最好但最贵。¥3,000 买的是零摩擦开发体验 + 这辈子用不完的算力 |
+
+#### 以前推荐过的为什么不再是首选
+
+| 平台 | 排除理由 |
+|------|---------|
+| RPi 5 8GB | ¥1,200+ 不如买 Radxa X4 (x86, 同价) |
+| RPi 5 16GB | ¥2,400 价格荒谬，够买 OPI5+ ×3 |
+| CM5 | 零售渠道稀少，需底板，无价格优势 |
+| BeagleBone AI-64 | TI 工具链不支持 PyTorch 直跑 |
+| Milk-V Jupiter | RISC-V PyTorch 生态不成熟 |
+| STM32H7 / Teensy 4.1 | 无 NN 能力，仅适用于纯 DSP fallback |
+
+### 12.4 6 TOPS 预算下的模型架构空间
+
+路线 1 (Radxa X4) 的 Intel N100 不需要模型转换，PyTorch 直跑。路线 2 (OPi5+) 的 NPU 需 RKNN 转换，但 16GB RAM 对 50M 参数模型宽裕。路线 3 (Jetson) 无任何妥协。
+
+实际算力需求：
+```
+方案 B 富参数模型 (~8M params): 每 Voice ~0.2 GOPS × 5 = 1 GOPS
+方案 B 大模型 (~50M params):   每 Voice ~1.0 GOPS × 5 = 5 GOPS
+```
+
+三个候选平台都能轻松承载。算力不是瓶颈，帧时间才是（§12.2）。
+
+### 12.5 复音数优化
 
 当前 5 复音的参数空间：5 Voice × (4 energy + 1 volume + ? timbre) = 25-30 维度。
 
@@ -676,33 +751,19 @@ P3+P4+P5 留到后续 Phase。
 - 推杆式演奏者通常同时操作 1-3 个推杆（双手）
 - 单 Voice 独奏时的 6 推杆已经占用大部分注意力
 - 多 Voice 同时发育的价值主要在合奏/和弦时体现
-- 30 推杆的物理占地 (~60cm 宽，按 2cm/推杆) 也需考虑
+- 30 推杆的物理占地 (~60cm 宽，按 2cm/推杆)
 
 候选方案：
-- **5 Voice × 6 推杆 (30)**：完整语义，但界面密度高。适合 "乐器 + 操作者" 模式（长期练习，形成肌肉记忆）
-- **4 Voice × 6 推杆 (24)**：SATB 四声部同构，和声理论天然匹配
-- **3 Voice × 6 推杆 (18)**：双手同时操作合理上限（一手 3 推杆），适合即兴演奏
+- **5 Voice × 6 推杆 (30)**：完整语义，界面密度高。适合长期练习形成肌肉记忆。
+- **4 Voice × 6 推杆 (24)**：SATB 四声部同构，和声理论天然匹配。
+- **3 Voice × 6 推杆 (18)**：双手操作合理上限（一手 3 推杆），适合即兴。
 
-### 12.4 建议分工
+### 12.6 Session 分工
 
-| 任务 | 推荐 Session | 原因 |
-|------|-------------|------|
-| Phase 9（音色广度实现） | 新 Coding Session | 需集中编码 + 频繁试听验证 |
-| 非谐波合成 (P0) | 同上，Phase 9 第一步 | 实现简单，音色差异大，快速验证 |
-| Hypernetwork 调制范围 (P1) | 同上，Phase 9 第二步 | 依赖 P0 的验证反馈 |
-| 共振峰滤波器 (P2) | 同上，Phase 9 第三步 | 实现后需试听调参 |
-| 硬件选型研究 | 独立 Research Session | 需查规格书、RTF profiling、成本对比，不需要写代码 |
-| 复音数优化决策 | 可作为讨论先在对话中定 | 设计决策，可在当前 Session 末尾讨论，或在新 Session 开头 |
-| RTF 性能 profiling | 硬件选型 Session 前半段 | 提供选型的算力约束数据 |
+| 任务 | 推荐 | 原因 |
+|------|------|------|
+| Phase 9（音色广度） | 新 Coding Session | 编码 + 试听验证 |
+| 硬件购买 + 部署 | 独立 Session | 刷系统、装 PyTorch、scp 代码、跑 benchmark |
+| 复音数决策 + 工业设计 | 买板后讨论 | 有物理板在手量尺寸、试推杆布局 |
+| 30 推杆控制器 | Phase 10 专项 | MIDI/USB-HID 推杆组映射到 energy/loudness/timbre |
 
-### 12.5 当前 Session 可收官
-
-当前 Session 已完成：
-1. Phase 8a 连续控制 ✓
-2. Phase 8b 混沌通道 ✓
-3. Phase 8c 可听发育 ✓
-4. 代码审计 + 修复 ✓
-5. 音色广度瓶颈分析 ✓
-6. 文档提交 ✓
-
-建议当前 Session 提交文档后收官。下一 Session 做 Phase 9 实现。硬件选型另开独立 Research Session。
