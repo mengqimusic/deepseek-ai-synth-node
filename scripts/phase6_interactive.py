@@ -45,7 +45,7 @@ from synth.dsp.processors import midi_to_hz
 ENERGY_LABELS = {"tension": "张", "turbulence": "扰", "resonance": "吟", "memory": "忆"}
 ENERGY_KEYS = {"tension": "q", "turbulence": "w", "resonance": "e", "memory": "r"}
 
-AUDIO_QUEUE_DEPTH = 64  # ~256ms buffer at 4ms frame
+AUDIO_QUEUE_DEPTH = 128  # ~512ms buffer at 4ms frame
 
 # ---------------------------------------------------------------------------
 # Shared state (main thread writes, inference thread reads)
@@ -205,7 +205,7 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
     audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_DEPTH)
 
     # Pre-fill before starting daemon thread to avoid concurrent state mutation
-    for _ in range(8):
+    for _ in range(32):
         audio_queue.put(synth.process_frame())
 
     infer_thread = threading.Thread(
