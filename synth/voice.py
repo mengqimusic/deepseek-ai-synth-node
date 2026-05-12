@@ -117,6 +117,7 @@ class VoiceModule(nn.Module):
         self._attack_alpha = 1.0 - math.exp(-(block_size / sample_rate) / (self.energy_attack_ms / 1000.0))
         self._release_alpha = 1.0 - math.exp(-(block_size / sample_rate) / (self.energy_release_ms / 1000.0))
         self._burst_decay = math.exp(-(block_size / sample_rate) / (self.energy_burst_decay_ms / 1000.0))
+        self._harmonic_phase: float = 0.0  # continuous phase across frames [0, harmonic_synth.table_size)
 
     def _apply_phase_baseline(self, levels: dict[str, float]) -> dict[str, float]:
         """Apply phase-based baseline floors to energy levels."""
@@ -309,6 +310,9 @@ class VoiceModule(nn.Module):
         """
         Synthesize audio from (possibly competition-modified) parameters (step 2/2).
 
+        Maintains continuous phase across frames via _harmonic_phase state,
+        preventing 250 Hz frame-rate artifacts.
+
         Args:
             harm_amps: [1, 1, n_harmonics]
             noise_mags: [1, 1, n_magnitudes]
@@ -318,7 +322,10 @@ class VoiceModule(nn.Module):
             audio: [block_size] numpy array
         """
         with torch.no_grad():
-            audio = self.harmonic_synth(harm_amps, f0_hz) + self.noise_synth(
+            phase_start = torch.tensor([self._harmonic_phase], device=harm_amps.device, dtype=harm_amps.dtype)
+            harm_audio, phase_end = self.harmonic_synth(harm_amps, f0_hz, phase_start=phase_start)
+            self._harmonic_phase = phase_end[0].item()
+            audio = harm_audio + self.noise_synth(
                 noise_mags, generator=self._noise_gen
             )
             return audio.squeeze(0).squeeze(0).cpu().numpy().astype("float32")
@@ -354,6 +361,7 @@ class VoiceModule(nn.Module):
         self._noise_gen.manual_seed(self.voice_id + 1)
         self._energy_smooth = {k: 0.0 for k in ENERGY_NAMES}
         self._burst_energy = {k: 0.0 for k in ENERGY_NAMES}
+        self._harmonic_phase = 0.0
 
     def reset_full(self):
         """Full reset including developmental state (destructive)."""

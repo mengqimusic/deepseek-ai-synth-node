@@ -50,20 +50,30 @@ class WavetableHarmonicSynth(nn.Module):
         wt = wt / rms
         return wt
 
-    def forward(self, harmonic_amps: torch.Tensor, f0_hz: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        harmonic_amps: torch.Tensor,
+        f0_hz: torch.Tensor,
+        phase_start: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Synthesize harmonic audio from frame-rate amplitudes and f0.
 
         Args:
             harmonic_amps: [B, T, n_harmonics]
             f0_hz:         [B, T]
+            phase_start:   [B] — initial phase offset in [0, table_size).
+                           When provided, returns (audio, phase_end) for
+                           continuous phase tracking across calls.
 
         Returns:
             audio: [B, T * block_size]
+            (audio, phase_end): if phase_start is provided — phase_end is [B]
         """
         B, T, _ = harmonic_amps.shape
         device = harmonic_amps.device
         dtype = harmonic_amps.dtype
+        track_phase = phase_start is not None
 
         f0_hz = f0_hz.clamp(min=1.0)
         phase_inc = f0_hz * self.table_size / self.sample_rate  # [B, T] — per sample
@@ -77,6 +87,10 @@ class WavetableHarmonicSynth(nn.Module):
         frame_start = torch.cat(
             [torch.zeros(B, 1, device=device, dtype=dtype), cum_phase[:, :-1]], dim=1
         )  # [B, T]
+
+        # Apply external phase start offset
+        if track_phase:
+            frame_start = (frame_start + phase_start.unsqueeze(1)) % self.table_size  # type: ignore[arg-type]
 
         # Sample indices for entire batch: [B, T, block_size]
         offsets = torch.arange(self.block_size, device=device, dtype=dtype)
@@ -102,5 +116,9 @@ class WavetableHarmonicSynth(nn.Module):
 
         samples = gather_floor * (1.0 - frac) + gather_ceil * frac  # [B*T, block_size]
         audio = samples.reshape(B, T * self.block_size)
+
+        if track_phase:
+            phase_end = (frame_start[:, -1] + phase_per_frame[:, -1]) % self.table_size  # type: ignore[index]
+            return audio, phase_end  # type: ignore[return-value]
 
         return audio
