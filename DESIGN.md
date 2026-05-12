@@ -567,3 +567,142 @@ Phase 5 实现了设计文档中"拓扑注入"的核心机制：一个小型 hyp
 ### 记忆系统
 
 明确使用 FRAM 存储，支持导出、遗传（跨机器迁移）、快捷键唤起（跳转/注入两种模式）。
+
+---
+
+## 11. Phase 8 后评估：音色广度瓶颈分析
+
+*分析日期: 2026-05-12, 基于 Phase 8 完整代码审计 + 实际演奏测试*
+
+### 11.1 当前音色空间的边界
+
+Phase 8 完成后，系统在表现力（dynamics、反馈、发育）上达到可用水平，但音色种类有明显边界。根因按影响程度排序：
+
+#### 瓶颈 1（根本性）：Decoder 仅学习 4 种音色类别
+
+DDSP Decoder (~258K 参数) 在 540 片段、4 类音色（string/brass/voice/electronic）、16kHz 的数据集上训练。Decoder 的权重空间内只有 4 个"引力盆地"——任何 `(f0, loudness)` 输入，输出的谐波/噪声分布都在这 4 个盆地的凸组合范围内。
+
+比对：一个只听过小提琴、长号、人声、电子音色的耳朵，无法想象大提琴、尺八、玻璃杯摩擦的声音。Decoder 的"音色词汇表"只有 4 个词。
+
+训练细节：`configs/phase5.yaml` 定义了 fixed energy→timbre 映射，每个 timbre class 对应一个四维 energy vector（如 string=[0.8, 0.1, 0.3, 0.2]）。Hypernetwork 被训练为将这些 energy vector 映射到 ΔW，使 decoder 输出接近对应 timbre。
+
+#### 瓶颈 2（结构性）：Hypernetwork 调制范围 ±12%
+
+```
+max_scale: 0.12  # configs/phase5.yaml
+harm_s = tanh(Linear(z)) * 0.12  # hypernetwork.py:79
+```
+
+设计意图：ΔW 作为"扰动 (perturbation)"而非"覆盖 (override)"。但这意味着 harm_head 权重最多偏离 12%。Phase 8c 的 energy boost (×5) 试图扩展范围，但 tanh 在输入 > 3.0 后饱和，boost 从 3.0 到 50.0 产生相同 ΔW。
+
+14 倍裕度分析：12% × 5.0 = 60% 理论最大扰动，但 tanh 饱和使实际有效范围仅 ~36%（3.0 × 0.12）。即便在理论最大值，也仅能扰动权重 60%。
+
+#### 瓶颈 3（合成层）：仅谐波 + 滤波噪声
+
+当前声音构成：
+```
+audio = IFFT(100 harmonic amplitudes) + mel-filtered white noise
+```
+
+缺失的合成维度：
+- **非谐波分量 (Inharmonicity)**：真实乐器的泛音不是精确整数倍。钢琴低音弦、钟、锣、金属板都有非谐波频谱。WavetableHarmonicSynth 的相位增量是精确的 `k × f0`，无法表达非谐波。
+- **共振峰 (Formants)**：人声和管乐器的固定共振峰频率不随音高改变。当前无 formant 滤波器。
+- **瞬态 (Transients)**：真实 attack 包含快速衰减的宽带能量。GRU 惯性 + block_size=64 (4ms) 无法表达亚毫秒级瞬态。
+- **频率调制 (FM)**：经典 FM 合成器（Yamaha DX7）的音色来自谐波间频率调制。当前仅有 AM（Energy Bias turb + Phase 8c FM），无真 FM。
+- **交叉合成 (Cross-synthesis)**：A 声音的频谱包络调制 B 声音。当前无。
+
+#### 瓶颈 4（数据层）：16kHz + 4ms 帧
+
+- sample_rate=16000 → Nyquist=8kHz，丢失 60% 可听高频
+- block_size=64 → 频谱分辨率 250Hz，低频细节不足
+- 540 片段规模较小，对音色多样性的覆盖有限
+
+#### 瓶颈 5（交互层）：四方向共享同一合成引擎
+
+四个 energy 方向各有独特签名，但都操作同一个 decoder + 同一个合成器。没有一个方向引入新信号路径。Phase 8c 的 turbulence FM 是朝正确方向的一步，但仍是 AM 域的调制。
+
+### 11.2 扩展优先级
+
+按"音色广度增量 / 实现成本"排序：
+
+| 优先级 | 方向 | 实现成本 | 音色收益 | 说明 |
+|--------|------|---------|---------|------|
+| P0 | B. 非谐波合成 | 低（~20 行） | 极大 | 解锁金属/铃铛/锣/玻璃整类音色 |
+| P1 | A. 扩大 Hypernetwork 调制范围 | 低（改参数） | 大 | 四方向表现力翻倍，需重新训练或至少验证 |
+| P2 | C. 共振峰滤波器 | 中（~50 行 DSP） | 大 | 解锁人声/管乐/哇音类音色 |
+| P3 | F. FM 合成路径 | 高（新增信号总线） | 中-大 | 解锁经典 FM 音色空间，turbulence 自然映射 |
+| P4 | D. 扩大训练数据 | 高（数据+训练） | 根本性 | 扩展 decoder 音色词汇表，从根本上解决问题 |
+| P5 | E. 提高采样率/分辨率 | 高（影响实时性能） | 中 | 提升频谱精度和高频带宽 |
+
+### 11.3 推荐路线：Phase 9 "音色广度"
+
+将 P0+P1+P2 打包为一个 Phase（~4-6h）：
+- 8c.1 非谐波：WavetableHarmonicSynth 新增 `inharmonicity` 参数，频率 `k × f0 → k × f0 × (1 + β × (k² - 1))`
+- 8c.2 扩大调制：max_scale 0.12 → 0.30，评估 tanh 饱和问题
+- 8c.3 共振峰：2-3 并联带通滤波器，吟 (resonance) 控制 formant 位置和 Q
+
+P3+P4+P5 留到后续 Phase。
+
+---
+
+## 12. 硬件规划：开发板选型 + 复音数优化
+
+*待进入独立分析 Phase，本节为方向性框架*
+
+### 12.1 分析的维度
+
+1. **算力约束**：当前 RTF 0.048 (Phase 1 DDSP baseline, Mac CPU)，但完整 5-Voice + hypernetwork + feedback + energy bias 的实测 RTF 待测量
+2. **内存约束**：5 个独立 Voice 的 GRU state + hypernetwork 权重 + delay buffer (memory) 需多大数据带宽
+3. **I/O 约束**：30 推杆 (ADC 通道) + 音频输出 (DAC) + 可能的 MIDI 输入
+4. **实时性约束**：4ms frame deadline (250Hz)，不能丢帧
+5. **人因约束**：30 推杆是否稀释演奏者注意力？3-4 个复音是否更科学？
+
+### 12.2 候选平台方向
+
+| 平台 | 算力 | 成本 | 适合度 |
+|------|------|------|--------|
+| Raspberry Pi 5 | 中 (ARM A76) | 低 | 可能跑 3-4 Voice |
+| Teensy 4.1 | 低 (ARM M7) | 极低 | 需轻量化模型，1-2 Voice |
+| Bela (BeagleBone + Xenomai) | 中 | 中 | 低延迟音频专用，适合原型 |
+| Jetson Nano/Orin | 高 (GPU) | 中-高 | 可跑全模型 |
+| STM32H7 | 极低 | 极低 | 需极简模型或纯 DSP fallback |
+| Mac/PC + MIDI 控制器 | 最高 | 高 | 最快验证交互设计 |
+
+### 12.3 复音数优化
+
+当前 5 复音的参数空间：5 Voice × (4 energy + 1 volume + ? timbre) = 25-30 维度。
+
+人因考量：
+- 推杆式演奏者通常同时操作 1-3 个推杆（双手）
+- 单 Voice 独奏时的 6 推杆已经占用大部分注意力
+- 多 Voice 同时发育的价值主要在合奏/和弦时体现
+- 30 推杆的物理占地 (~60cm 宽，按 2cm/推杆) 也需考虑
+
+候选方案：
+- **5 Voice × 6 推杆 (30)**：完整语义，但界面密度高。适合 "乐器 + 操作者" 模式（长期练习，形成肌肉记忆）
+- **4 Voice × 6 推杆 (24)**：SATB 四声部同构，和声理论天然匹配
+- **3 Voice × 6 推杆 (18)**：双手同时操作合理上限（一手 3 推杆），适合即兴演奏
+
+### 12.4 建议分工
+
+| 任务 | 推荐 Session | 原因 |
+|------|-------------|------|
+| Phase 9（音色广度实现） | 新 Coding Session | 需集中编码 + 频繁试听验证 |
+| 非谐波合成 (P0) | 同上，Phase 9 第一步 | 实现简单，音色差异大，快速验证 |
+| Hypernetwork 调制范围 (P1) | 同上，Phase 9 第二步 | 依赖 P0 的验证反馈 |
+| 共振峰滤波器 (P2) | 同上，Phase 9 第三步 | 实现后需试听调参 |
+| 硬件选型研究 | 独立 Research Session | 需查规格书、RTF profiling、成本对比，不需要写代码 |
+| 复音数优化决策 | 可作为讨论先在对话中定 | 设计决策，可在当前 Session 末尾讨论，或在新 Session 开头 |
+| RTF 性能 profiling | 硬件选型 Session 前半段 | 提供选型的算力约束数据 |
+
+### 12.5 当前 Session 可收官
+
+当前 Session 已完成：
+1. Phase 8a 连续控制 ✓
+2. Phase 8b 混沌通道 ✓
+3. Phase 8c 可听发育 ✓
+4. 代码审计 + 修复 ✓
+5. 音色广度瓶颈分析 ✓
+6. 文档提交 ✓
+
+建议当前 Session 提交文档后收官。下一 Session 做 Phase 9 实现。硬件选型另开独立 Research Session。
