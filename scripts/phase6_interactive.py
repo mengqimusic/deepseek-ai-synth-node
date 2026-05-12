@@ -36,8 +36,9 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from synth.nn.model import DDSPModel
-from synth.nn.hypernetwork import Hypernetwork
+from synth.nn.model import RichParamModel
+from synth.nn.hypernetwork import HypernetworkV2
+from synth.nn.modulated_decoder import ModulatedRichDecoder
 from synth.poly import PolyphonicSynth
 from synth.voice import ENERGY_NAMES, PHASE_THRESHOLDS, PHASE_BASELINE
 from synth.dsp.processors import midi_to_hz
@@ -555,8 +556,8 @@ def load_model_with_hypernetwork(
     base_checkpoint: str,
     hypernetwork_checkpoint: str,
     device: str,
-) -> tuple[PolyphonicSynth, DDSPModel]:
-    """Load base model + hypernetwork, wire into PolyphonicSynth."""
+) -> tuple[PolyphonicSynth, RichParamModel]:
+    """Load RichParamModel + HypernetworkV2, wire into PolyphonicSynth."""
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
@@ -566,29 +567,33 @@ def load_model_with_hypernetwork(
     block_size = data_cfg["block_size"]
 
     ckpt = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
-    model = DDSPModel(
-        hidden_size=model_cfg["hidden_size"],
-        n_harmonics=model_cfg["n_harmonics"],
-        n_magnitudes=model_cfg["n_magnitudes"],
+    model = RichParamModel(
         sample_rate=sample_rate,
         block_size=block_size,
         table_size=model_cfg.get("table_size", 2048),
+        transformer_dim=model_cfg["transformer_dim"],
+        transformer_heads=model_cfg["transformer_heads"],
+        transformer_layers=model_cfg["transformer_layers"],
+        gru_hidden=model_cfg["gru_hidden"],
+        n_harmonics=model_cfg["n_harmonics"],
+        n_noise_mel=model_cfg["n_noise_mel"],
+        n_noise_grain=model_cfg["n_noise_grain"],
+        beta_max=model_cfg.get("beta_max", 0.02),
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()
 
-    hypernetwork = Hypernetwork(
-        hidden_size=model_cfg["hidden_size"],
-        n_harmonics=model_cfg["n_harmonics"],
-        n_magnitudes=model_cfg["n_magnitudes"],
+    hypernetwork_v2 = HypernetworkV2(
+        input_dim=4,
+        hidden_size=model_cfg["gru_hidden"],
         bottleneck=model_cfg.get("bottleneck", 48),
-        max_scale=model_cfg.get("max_scale", 0.12),
+        max_scale=model_cfg.get("max_scale", 0.30),
     )
     h_ckpt = torch.load(hypernetwork_checkpoint, map_location="cpu", weights_only=False)
-    hypernetwork.load_state_dict(h_ckpt["hypernetwork_state_dict"])
-    hypernetwork.to(device)
-    hypernetwork.eval()
+    hypernetwork_v2.load_state_dict(h_ckpt["hypernetwork_state_dict"])
+    hypernetwork_v2.to(device)
+    hypernetwork_v2.eval()
 
     synth = PolyphonicSynth(
         decoder=model.decoder,
@@ -596,10 +601,13 @@ def load_model_with_hypernetwork(
         noise_synth=model.noise_synth,
         num_voices=5,
         n_harmonics=model_cfg["n_harmonics"],
-        n_magnitudes=model_cfg["n_magnitudes"],
+        n_magnitudes=model_cfg["n_noise_mel"],
         sample_rate=sample_rate,
         block_size=block_size,
-        hypernetwork=hypernetwork,
+        hypernetwork_v2=hypernetwork_v2,
+        fm_synth=model.fm_synth,
+        grain_synth=model.grain_synth,
+        transient_synth=model.transient_synth,
     )
     synth.to(device)
     synth.eval()
@@ -612,9 +620,9 @@ def load_model_with_hypernetwork(
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Phase 6 interactive hypernetwork + 5-Voice test")
-    parser.add_argument("--base-checkpoint", default="checkpoints/phase1_final.pt")
-    parser.add_argument("--hypernetwork-checkpoint", default="checkpoints/phase5_final.pt")
-    parser.add_argument("--config", default="configs/phase5.yaml")
+    parser.add_argument("--base-checkpoint", default="checkpoints/phase10a_final.pt")
+    parser.add_argument("--hypernetwork-checkpoint", default="checkpoints/phase10a_hn_final.pt")
+    parser.add_argument("--config", default="configs/phase10a.yaml")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--no-hypernetwork", action="store_true",
                         help="Run without hypernetwork for baseline comparison")
@@ -644,12 +652,18 @@ def main():
         block_size = data_cfg["block_size"]
 
         ckpt = torch.load(args.base_checkpoint, map_location="cpu", weights_only=False)
-        model = DDSPModel(
-            hidden_size=model_cfg["hidden_size"],
-            n_harmonics=model_cfg["n_harmonics"],
-            n_magnitudes=model_cfg["n_magnitudes"],
+        model = RichParamModel(
             sample_rate=sample_rate,
             block_size=block_size,
+            table_size=model_cfg.get("table_size", 2048),
+            transformer_dim=model_cfg["transformer_dim"],
+            transformer_heads=model_cfg["transformer_heads"],
+            transformer_layers=model_cfg["transformer_layers"],
+            gru_hidden=model_cfg["gru_hidden"],
+            n_harmonics=model_cfg["n_harmonics"],
+            n_noise_mel=model_cfg["n_noise_mel"],
+            n_noise_grain=model_cfg["n_noise_grain"],
+            beta_max=model_cfg.get("beta_max", 0.02),
         )
         model.load_state_dict(ckpt["model_state_dict"])
         model.to(args.device)
@@ -660,8 +674,13 @@ def main():
             harmonic_synth=model.harmonic_synth,
             noise_synth=model.noise_synth,
             num_voices=5,
+            n_harmonics=model_cfg["n_harmonics"],
+            n_magnitudes=model_cfg["n_noise_mel"],
             sample_rate=sample_rate,
             block_size=block_size,
+            fm_synth=model.fm_synth,
+            grain_synth=model.grain_synth,
+            transient_synth=model.transient_synth,
         )
         synth.to(args.device)
         synth.eval()

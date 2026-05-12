@@ -2,7 +2,7 @@
 PolyphonicSynth — top-level orchestrator for 5 independent Voices.
 
 Wires together:
-  - 5 VoiceModules (shared DDSPDecoder weights, independent state)
+  - 5 VoiceModules (shared decoder weights, independent state)
   - VoiceAllocator (round-robin)
   - SpectralCompetitionScheduler (soft gain scheduling)
   - Mixer (sum all Voice outputs)

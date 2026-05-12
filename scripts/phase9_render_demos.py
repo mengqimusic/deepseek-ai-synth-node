@@ -2,13 +2,13 @@
 """Render Phase 9 feature demos: inharmonicity, formant filter, expanded modulation.
 
 Generates WAV files demonstrating each new feature in isolation and combined.
-Uses VoiceModule to exercise the full pipeline (decoder → energy bias → synth).
+Uses VoiceModule to exercise the full pipeline (decoder → energy bias → 6 DSP buses).
 """
 
 import torch, yaml, numpy as np, os, math
-from synth.nn.model import DDSPModel
-from synth.nn.hypernetwork import Hypernetwork
-from synth.nn.modulated_decoder import ModulatedDecoder
+from synth.nn.model import RichParamModel
+from synth.nn.hypernetwork import HypernetworkV2
+from synth.nn.modulated_decoder import ModulatedRichDecoder
 from synth.voice import VoiceModule, ENERGY_NAMES
 from synth.dsp.processors import midi_to_hz
 import scipy.io.wavfile as _wav
@@ -20,39 +20,60 @@ def _write_wav(path, audio, sr):
     _wav.write(path, sr, (audio * 32767.0).astype(np.int16))
 
 # ---------------------------------------------------------------------------
-# Config & checkpoint loading
+# Config & model construction
 # ---------------------------------------------------------------------------
-with open("configs/phase1.yaml") as f:
+with open("configs/phase10a.yaml") as f:
     config = yaml.safe_load(f)
 model_cfg, data_cfg = config["model"], config["data"]
 sample_rate, block_size = data_cfg["sample_rate"], data_cfg["block_size"]
 
-ckpt = torch.load("checkpoints/phase1_final.pt", map_location="cpu", weights_only=False)
-model = DDSPModel(
-    hidden_size=model_cfg["hidden_size"], n_harmonics=model_cfg["n_harmonics"],
-    n_magnitudes=model_cfg["n_magnitudes"], sample_rate=sample_rate,
-    block_size=block_size, table_size=model_cfg["table_size"],
+# Construct model (random weights — load a trained checkpoint when available)
+model = RichParamModel(
+    sample_rate=sample_rate,
+    block_size=block_size,
+    table_size=model_cfg.get("table_size", 2048),
+    transformer_dim=model_cfg["transformer_dim"],
+    transformer_heads=model_cfg["transformer_heads"],
+    transformer_layers=model_cfg["transformer_layers"],
+    gru_hidden=model_cfg["gru_hidden"],
+    n_harmonics=model_cfg["n_harmonics"],
+    n_noise_mel=model_cfg["n_noise_mel"],
+    n_noise_grain=model_cfg["n_noise_grain"],
+    beta_max=model_cfg.get("beta_max", 0.02),
 )
-model.load_state_dict(ckpt["model_state_dict"])
 model.eval()
 
+# Try loading a RichParamModel checkpoint
+ckpt_paths = [
+    "checkpoints/phase10a_final.pt",
+    "checkpoints/phase10a_step_005000.pt",
+]
+for ckpt_path in ckpt_paths:
+    if os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+        print(f"Loaded checkpoint: {ckpt_path} (step {ckpt.get('step', '?')})")
+        break
+else:
+    print("No RichParamModel checkpoint found, using random weights (audio will be noise)")
+
 # Try loading hypernetwork for richer timbre
-hypernetwork = None
+hypernetwork_v2 = None
 modulated_decoder = None
 try:
-    h_ckpt = torch.load("checkpoints/phase5_final.pt", map_location="cpu", weights_only=False)
-    hypernetwork = Hypernetwork(
-        input_dim=4, hidden_size=model_cfg["hidden_size"],
-        n_harmonics=model_cfg["n_harmonics"], n_magnitudes=model_cfg["n_magnitudes"],
-        bottleneck=48, max_scale=0.30,  # Phase 9: expanded modulation range
+    h_ckpt = torch.load("checkpoints/phase10a_hn_final.pt", map_location="cpu", weights_only=False)
+    hypernetwork_v2 = HypernetworkV2(
+        input_dim=4, hidden_size=model_cfg["gru_hidden"],
+        bottleneck=48, max_scale=0.30,
     )
-    hypernetwork.load_state_dict(h_ckpt["hypernetwork_state_dict"])
-    hypernetwork.eval()
-    modulated_decoder = ModulatedDecoder(
-        base_decoder=model.decoder, hypernetwork=hypernetwork, frozen_decoder=True,
+    hypernetwork_v2.load_state_dict(h_ckpt["hypernetwork_state_dict"])
+    hypernetwork_v2.eval()
+    modulated_decoder = ModulatedRichDecoder(
+        base_decoder=model.decoder, hypernetwork=hypernetwork_v2, frozen_decoder=True,
     )
     modulated_decoder.eval()
-    print("Loaded hypernetwork checkpoint (phase5_final.pt)")
+    print("Loaded hypernetwork checkpoint (phase10a_hn_final.pt)")
 except FileNotFoundError:
     print("No hypernetwork checkpoint found, using base decoder only")
 
@@ -65,10 +86,13 @@ voice = VoiceModule(
     harmonic_synth=model.harmonic_synth,
     noise_synth=model.noise_synth,
     n_harmonics=model_cfg["n_harmonics"],
-    n_magnitudes=model_cfg["n_magnitudes"],
+    n_magnitudes=model_cfg["n_noise_mel"],
     sample_rate=sample_rate,
     block_size=block_size,
     modulated_decoder=modulated_decoder,
+    fm_synth=model.fm_synth,
+    grain_synth=model.grain_synth,
+    transient_synth=model.transient_synth,
 )
 voice.eval()
 
@@ -230,11 +254,6 @@ print("  -> outputs/phase9/00_baseline_no_energy.wav")
 # ===================================================================
 print("Rendering Demo 6: Pitch sweep + inharmonicity...")
 
-def pitch_sweep_inharm(t, total, sec):
-    """Constant high tension so inharmonicity is always on."""
-    return {"tension": 0.8}
-
-# G3 → C5 sweep with inharmonicity on
 f0_start = midi_to_hz(55)  # G3
 f0_end = midi_to_hz(72)    # C5
 n_frames = int(4.0 * sample_rate / block_size)

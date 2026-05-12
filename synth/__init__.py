@@ -1,1 +1,1 @@
-# ai-synth-node: DDSP + Hypernetwork synthesizer
+# ai-synth-node: Rich-parameter neural synthesizer

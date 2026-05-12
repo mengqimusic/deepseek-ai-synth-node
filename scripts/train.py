@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a DDSP model on preprocessed data."""
+"""Train a RichParamModel on preprocessed data."""
 
 import argparse
 import warnings
@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 warnings.filterwarnings("ignore", message=".*resized.*")
 warnings.filterwarnings("ignore", message=".*An output with one or more.*")
 
-from synth.nn.model import DDSPModel
+from synth.nn.model import RichParamModel
 from synth.train.losses import MultiScaleSpectralLoss
 from synth.train.trainer import Trainer
 from synth.data.dataset import DDSPDataset, collate_variable_length
@@ -18,7 +18,7 @@ from synth.data.dataset import DDSPDataset, collate_variable_length
 
 def main():
     parser = argparse.ArgumentParser(description="Train DDSP model")
-    parser.add_argument("--config", default="configs/phase1.yaml", help="Config file")
+    parser.add_argument("--config", default="configs/phase10a.yaml", help="Config file")
     parser.add_argument("--data_dir", default="data/processed", help="Preprocessed data")
     parser.add_argument("--device", default="cpu", help="Device (cpu/cuda)")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint")
@@ -54,13 +54,18 @@ def main():
     print(f"Train: {len(train_dataset)} clips, Val: {len(val_dataset)} clips")
 
     # Model
-    model = DDSPModel(
-        hidden_size=model_cfg["hidden_size"],
-        n_harmonics=model_cfg["n_harmonics"],
-        n_magnitudes=model_cfg["n_magnitudes"],
+    model = RichParamModel(
         sample_rate=data_cfg["sample_rate"],
         block_size=data_cfg["block_size"],
-        table_size=model_cfg["table_size"],
+        table_size=model_cfg.get("table_size", 2048),
+        transformer_dim=model_cfg["transformer_dim"],
+        transformer_heads=model_cfg["transformer_heads"],
+        transformer_layers=model_cfg["transformer_layers"],
+        gru_hidden=model_cfg["gru_hidden"],
+        n_harmonics=model_cfg["n_harmonics"],
+        n_noise_mel=model_cfg["n_noise_mel"],
+        n_noise_grain=model_cfg["n_noise_grain"],
+        beta_max=model_cfg.get("beta_max", 0.02),
     )
     param_info = model.count_parameters()
     print(f"Model: decoder={param_info['decoder']:,} params, total={param_info['total']:,}")

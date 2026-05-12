@@ -9,7 +9,7 @@ def measure_latency(model, device: str = "cpu", n_warmup: int = 50, n_timed: int
     Measure per-frame inference latency breakdown.
 
     Args:
-        model: DDSPModel
+        model: RichParamModel
         device: "cpu" or "cuda"
         n_warmup: warmup frames (discarded)
         n_timed: timed frames
@@ -24,14 +24,13 @@ def measure_latency(model, device: str = "cpu", n_warmup: int = 50, n_timed: int
     f0_hz = torch.randn(1, total_frames).abs() * 500 + 100
     f0_hz = f0_hz.clamp(min=20.0, max=2000.0).to(device)
     loudness = (torch.randn(1, total_frames) * 10 - 20).to(device)
-    f0_scaled = torch.log(f0_hz.clamp(min=20.0) / 20.0) / torch.log(
-        torch.tensor(2000.0 / 20.0)
-    )
-    f0_scaled = f0_scaled.to(device)
 
-    # Warmup
+    from synth.dsp.processors import scale_f0
+    f0_scaled = scale_f0(f0_hz)
+
+    # Warmup decoder
     for i in range(n_warmup):
-        harm, noise = model.decoder(
+        _ = model.decoder(
             f0_scaled[:, i : i + 1], loudness[:, i : i + 1]
         )
 
@@ -39,7 +38,7 @@ def measure_latency(model, device: str = "cpu", n_warmup: int = 50, n_timed: int
     times_decoder = []
     for i in range(n_timed):
         t0 = time.perf_counter()
-        harm, noise = model.decoder(
+        _ = model.decoder(
             f0_scaled[:, n_warmup + i : n_warmup + i + 1],
             loudness[:, n_warmup + i : n_warmup + i + 1],
         )
@@ -50,16 +49,17 @@ def measure_latency(model, device: str = "cpu", n_warmup: int = 50, n_timed: int
     # Warmup harmonic synth
     for i in range(n_warmup):
         _ = model.harmonic_synth(
-            torch.rand(1, 1, 100, device=device),
+            torch.rand(1, 1, model.n_harmonics, device=device),
             torch.tensor([[440.0]], device=device),
         )
 
     # Timed: harmonic synth
     times_harmonic = []
     for i in range(n_timed):
+        harm_amps = torch.rand(1, 1, model.n_harmonics, device=device)
         t0 = time.perf_counter()
         _ = model.harmonic_synth(
-            harm.view(1, 1, -1),
+            harm_amps,
             f0_hz[:, n_warmup + i : n_warmup + i + 1],
         )
         if device == "cuda":
@@ -75,10 +75,9 @@ def measure_latency(model, device: str = "cpu", n_warmup: int = 50, n_timed: int
     # Timed: noise synth
     times_noise = []
     for i in range(n_timed):
+        noise_mags = torch.rand(1, 1, 65, device=device)
         t0 = time.perf_counter()
-        _ = model.noise_synth(
-            noise.view(1, 1, -1),
-        )
+        _ = model.noise_synth(noise_mags)
         if device == "cuda":
             torch.cuda.synchronize()
         times_noise.append(time.perf_counter() - t0)
@@ -91,7 +90,6 @@ def measure_latency(model, device: str = "cpu", n_warmup: int = 50, n_timed: int
     noise_ms = np.mean(times_noise) * 1000
     total_ms = np.mean(times_total) * 1000
 
-    # Frame generates block_size=128 samples at 16kHz = 8ms of audio
     frame_duration_ms = model.block_size / model.sample_rate * 1000
     rtf = total_ms / frame_duration_ms
 

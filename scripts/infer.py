@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run DDSP inference: reconstruction and synthesis."""
+"""Run RichParamModel inference: reconstruction and synthesis."""
 
 import argparse
 from pathlib import Path
@@ -9,7 +9,7 @@ import torch
 import yaml
 from scipy.io import wavfile
 
-from synth.nn.model import DDSPModel
+from synth.nn.model import RichParamModel
 from synth.dsp.processors import de_emphasis, midi_to_hz
 
 
@@ -46,9 +46,9 @@ def synthesize(model, f0_hz, duration_sec, loudness_db, output_path, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DDSP inference")
+    parser = argparse.ArgumentParser(description="RichParamModel inference")
     parser.add_argument("--checkpoint", required=True, help="Model checkpoint")
-    parser.add_argument("--config", default="configs/phase1.yaml", help="Config file")
+    parser.add_argument("--config", default="configs/phase10a.yaml", help="Config file")
     parser.add_argument("--output_dir", default="outputs", help="Output directory")
     parser.add_argument("--data_dir", default="data/processed", help="Processed data dir")
     parser.add_argument("--device", default="cpu")
@@ -63,13 +63,18 @@ def main():
 
     # Load model
     ckpt = torch.load(args.checkpoint, map_location="cpu")
-    model = DDSPModel(
-        hidden_size=config["model"]["hidden_size"],
-        n_harmonics=config["model"]["n_harmonics"],
-        n_magnitudes=config["model"]["n_magnitudes"],
+    model = RichParamModel(
         sample_rate=config["data"]["sample_rate"],
         block_size=config["data"]["block_size"],
-        table_size=config["model"]["table_size"],
+        table_size=config["model"].get("table_size", 2048),
+        transformer_dim=config["model"]["transformer_dim"],
+        transformer_heads=config["model"]["transformer_heads"],
+        transformer_layers=config["model"]["transformer_layers"],
+        gru_hidden=config["model"]["gru_hidden"],
+        n_harmonics=config["model"]["n_harmonics"],
+        n_noise_mel=config["model"]["n_noise_mel"],
+        n_noise_grain=config["model"]["n_noise_grain"],
+        beta_max=config["model"].get("beta_max", 0.02),
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(args.device)
