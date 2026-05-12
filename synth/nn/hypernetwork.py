@@ -24,7 +24,7 @@ class Hypernetwork(nn.Module):
         n_harmonics: int = 100,
         n_magnitudes: int = 65,
         bottleneck: int = 48,
-        max_scale: float = 0.12,
+        max_scale: float = 0.30,
         bias_scale: float = 0.2,
     ):
         super().__init__()

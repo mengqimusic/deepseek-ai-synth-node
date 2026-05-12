@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from synth.energy import EnergyBiasModule
 from synth.dsp.processors import scale_f0
+from synth.dsp.formant import FormantFilter
 
 ENERGY_NAMES = ["tension", "turbulence", "resonance", "memory"]
 
@@ -118,6 +119,16 @@ class VoiceModule(nn.Module):
         self._release_alpha = 1.0 - math.exp(-(block_size / sample_rate) / (self.energy_release_ms / 1000.0))
         self._burst_decay = math.exp(-(block_size / sample_rate) / (self.energy_burst_decay_ms / 1000.0))
         self._harmonic_phase: float = 0.0  # continuous phase across frames [0, harmonic_synth.table_size)
+
+        # Inharmonic synthesis state (Phase 9)
+        self._inharmonicity: float = 0.0  # β from tension level, mapped to [0, 0.01]
+        self._harmonic_phase_inharmonic: torch.Tensor | None = None  # [n_harmonics] in radians
+
+        # Formant filter (Phase 9)
+        self._resonance_level: float = 0.0
+        self.formant_filter = FormantFilter(
+            n_bands=3, sample_rate=sample_rate,
+        )
 
     def _apply_phase_baseline(self, levels: dict[str, float]) -> dict[str, float]:
         """Apply phase-based baseline floors to energy levels."""
@@ -306,6 +317,10 @@ class VoiceModule(nn.Module):
             target_levels = self._apply_phase_baseline(levels)
             effective_levels = self._apply_energy_dynamics(target_levels)
 
+            # Phase 9: derive inharmonicity β from tension, store resonance level
+            self._inharmonicity = effective_levels["tension"] * 0.01  # β ∈ [0, 0.01]
+            self._resonance_level = effective_levels["resonance"]
+
             # Accumulate energy
             for k in ENERGY_NAMES:
                 self.state.energy_accumulation[k] += effective_levels[k] * self.frame_duration
@@ -410,6 +425,9 @@ class VoiceModule(nn.Module):
         Maintains continuous phase across frames via _harmonic_phase state,
         preventing 250 Hz frame-rate artifacts.
 
+        Phase 9: inharmonicity β from tension drives per-harmonic frequency
+        stretching; formant filter from resonance shapes spectral envelope.
+
         Args:
             harm_amps: [1, 1, n_harmonics]
             noise_mags: [1, 1, n_magnitudes]
@@ -422,9 +440,52 @@ class VoiceModule(nn.Module):
             # Turbulence FM: noise tracks harmonic structure (Phase 8c)
             noise_mags = self._apply_turbulence_fm(noise_mags, harm_amps)
 
-            phase_start = torch.tensor([self._harmonic_phase], device=harm_amps.device, dtype=harm_amps.dtype)
-            harm_audio, phase_end = self.harmonic_synth(harm_amps, f0_hz, phase_start=phase_start)
-            self._harmonic_phase = phase_end[0].item()
+            # Inharmonic path (Phase 9): per-harmonic phase tracking in radians
+            if self._inharmonicity > 0.0:
+                device = harm_amps.device
+                dtype = harm_amps.dtype
+                n_h = harm_amps.shape[-1]
+
+                if self._harmonic_phase_inharmonic is None:
+                    # Bridge from harmonic phase (table index) to inharmonic (radians)
+                    bridge_rad = self._harmonic_phase / self.harmonic_synth.table_size * (2.0 * math.pi)
+                    self._harmonic_phase_inharmonic = torch.full(
+                        (n_h,), bridge_rad, device=device, dtype=dtype
+                    )
+
+                beta = torch.tensor([[self._inharmonicity]], device=device, dtype=dtype)
+                phase_start = self._harmonic_phase_inharmonic.unsqueeze(0)  # [1, n_h]
+                harm_audio, phase_end = self.harmonic_synth(
+                    harm_amps, f0_hz,
+                    phase_start=phase_start,
+                    inharmonicity=beta,
+                )
+                self._harmonic_phase_inharmonic = phase_end[0]  # [n_h]
+
+                # Keep harmonic phase in sync for reverse transition
+                self._harmonic_phase = (
+                    phase_end[0, 0].item() / (2.0 * math.pi) * self.harmonic_synth.table_size
+                ) % self.harmonic_synth.table_size
+            else:
+                # Harmonic path: scalar phase in table index units
+                # Bridge from inharmonic if we just switched
+                if self._harmonic_phase_inharmonic is not None:
+                    self._harmonic_phase = (
+                        self._harmonic_phase_inharmonic[0].item() / (2.0 * math.pi) * self.harmonic_synth.table_size
+                    ) % self.harmonic_synth.table_size
+                    self._harmonic_phase_inharmonic = None
+
+                phase_start = torch.tensor(
+                    [self._harmonic_phase], device=harm_amps.device, dtype=harm_amps.dtype
+                )
+                harm_audio, phase_end = self.harmonic_synth(harm_amps, f0_hz, phase_start=phase_start)
+                self._harmonic_phase = phase_end[0].item()
+
+            # Formant filter (Phase 9): resonance direction shapes harmonic spectrum
+            if self._resonance_level > 0.0:
+                r_level = torch.tensor([self._resonance_level], device=harm_audio.device, dtype=harm_audio.dtype)
+                harm_audio = self.formant_filter(harm_audio, r_level)
+
             audio = harm_audio + self.noise_synth(
                 noise_mags, generator=self._noise_gen
             )
@@ -462,6 +523,9 @@ class VoiceModule(nn.Module):
         self._energy_smooth = {k: 0.0 for k in ENERGY_NAMES}
         self._burst_energy = {k: 0.0 for k in ENERGY_NAMES}
         self._harmonic_phase = 0.0
+        self._harmonic_phase_inharmonic = None
+        self._inharmonicity = 0.0
+        self._resonance_level = 0.0
 
     def reset_full(self):
         """Full reset including developmental state (destructive)."""
