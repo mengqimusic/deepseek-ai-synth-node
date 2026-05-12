@@ -91,6 +91,7 @@ def inference_loop(synth: PolyphonicSynth, audio_queue: queue.Queue, block_size:
                 if _modulation_bypass:
                     levels = {k: 0.0 for k in ENERGY_NAMES}
                 synth.set_all_energy(vid, levels)
+                synth.set_loudness(vid, _voice_loudness[vid])
 
         # Feedback sync (read-only globals, no lock needed)
         synth.set_feedback_bypass(_feedback_bypass)

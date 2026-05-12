@@ -144,6 +144,9 @@ class PolyphonicSynth(nn.Module):
             {k: 0.0 for k in ENERGY_NAMES} for _ in range(num_voices)
         ]
 
+        # Per-voice continuous loudness (dB) — updated each frame by performer
+        self._voice_loudness: list[float] = [-10.0] * num_voices
+
     # ------------------------------------------------------------------
     # Note interface
     # ------------------------------------------------------------------
@@ -179,6 +182,16 @@ class PolyphonicSynth(nn.Module):
         if 0 <= voice_id < self.num_voices:
             for k in ENERGY_NAMES:
                 self._energy_levels[voice_id][k] = max(0.0, min(1.0, levels.get(k, 0.0)))
+
+    def set_loudness(self, voice_id: int, db: float):
+        """Set continuous loudness for a specific Voice (dB, -40 to 0)."""
+        if 0 <= voice_id < self.num_voices:
+            self._voice_loudness[voice_id] = max(-40.0, min(0.0, db))
+
+    def set_all_loudness(self, db: float):
+        """Set continuous loudness for all Voices."""
+        for i in range(self.num_voices):
+            self._voice_loudness[i] = max(-40.0, min(0.0, db))
 
     def set_energy_gain(self, voice_id: int, gain: float):
         """Set hypernetwork energy gain for a specific Voice (1.0 = default)."""
@@ -335,7 +348,7 @@ class PolyphonicSynth(nn.Module):
                 continue
 
             f0_hz = midi_to_hz(playing_note)
-            loudness = voice.state.active_loudness
+            loudness = self._voice_loudness[voice_id]
             levels = self._energy_levels[voice_id]
 
             harm, noise, _f0_tensor = voice.process_params(f0_hz, loudness, levels)
@@ -415,7 +428,7 @@ class PolyphonicSynth(nn.Module):
                 continue
 
             f0_hz = midi_to_hz(playing_note)
-            loudness = voice.state.active_loudness
+            loudness = self._voice_loudness[voice_id]
             levels = self._energy_levels[voice_id]
 
             audio, _, _ = voice.process_frame(f0_hz, loudness, levels)
@@ -452,6 +465,7 @@ class PolyphonicSynth(nn.Module):
         self._energy_levels = [
             {k: 0.0 for k in ENERGY_NAMES} for _ in range(self.num_voices)
         ]
+        self._voice_loudness = [-10.0] * self.num_voices
         self.feedback.reset_all()
 
     def reset_voice(self, voice_id: int):
@@ -462,4 +476,5 @@ class PolyphonicSynth(nn.Module):
                     del self.allocator._active_notes[midi]
             self.voices[voice_id].reset_full()
             self._energy_levels[voice_id] = {k: 0.0 for k in ENERGY_NAMES}
+            self._voice_loudness[voice_id] = -10.0
             self.feedback.reset_voice(voice_id)
