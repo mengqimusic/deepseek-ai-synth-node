@@ -15,9 +15,8 @@ import torch
 import torch.nn as nn
 
 from synth.dsp.processors import midi_to_hz
-from synth.nn.decoder import DDSPDecoder
-from synth.nn.hypernetwork import Hypernetwork, HypernetworkV2
-from synth.nn.modulated_decoder import ModulatedDecoder, ModulatedRichDecoder
+from synth.nn.hypernetwork import HypernetworkV2
+from synth.nn.modulated_decoder import ModulatedRichDecoder
 from synth.nn.transformer_decoder import RichParamDecoder
 from synth.dsp.harmonic import WavetableHarmonicSynth
 from synth.dsp.noise import FilteredNoiseSynth, GrainNoiseSynth
@@ -93,16 +92,14 @@ class PolyphonicSynth(nn.Module):
 
     def __init__(
         self,
-        decoder: DDSPDecoder,
+        decoder: RichParamDecoder,
         harmonic_synth: WavetableHarmonicSynth,
         noise_synth: FilteredNoiseSynth,
         num_voices: int = 5,
-        n_harmonics: int = 100,
+        n_harmonics: int = 256,
         n_magnitudes: int = 65,
         sample_rate: int = 16000,
         block_size: int = 64,
-        hypernetwork: Hypernetwork | None = None,
-        rich_mode: bool = False,
         hypernetwork_v2: HypernetworkV2 | None = None,
         fm_synth: FMSynth | None = None,
         grain_synth: GrainNoiseSynth | None = None,
@@ -112,29 +109,16 @@ class PolyphonicSynth(nn.Module):
         self.num_voices = num_voices
         self.block_size = block_size
         self.sample_rate = sample_rate
-        self.rich_mode = rich_mode
 
-        if rich_mode:
-            if hasattr(decoder, 'n_harmonics'):
-                n_harmonics = decoder.n_harmonics
-            if hasattr(decoder, 'n_noise_mel'):
-                n_magnitudes = decoder.n_noise_mel
+        if hasattr(decoder, 'n_harmonics'):
+            n_harmonics = decoder.n_harmonics
+        if hasattr(decoder, 'n_noise_mel'):
+            n_magnitudes = decoder.n_noise_mel
 
-        if rich_mode:
-            # RichParamDecoder path
-            if hypernetwork_v2 is not None:
-                modulated_decoder = ModulatedRichDecoder(
-                    base_decoder=decoder,
-                    hypernetwork=hypernetwork_v2,
-                    frozen_decoder=True,
-                )
-            else:
-                modulated_decoder = None
-        elif hypernetwork is not None:
-            # Legacy modulated decoder
-            modulated_decoder = ModulatedDecoder(
+        if hypernetwork_v2 is not None:
+            modulated_decoder = ModulatedRichDecoder(
                 base_decoder=decoder,
-                hypernetwork=hypernetwork,
+                hypernetwork=hypernetwork_v2,
                 frozen_decoder=True,
             )
         else:
@@ -151,7 +135,6 @@ class PolyphonicSynth(nn.Module):
                 sample_rate=sample_rate,
                 block_size=block_size,
                 modulated_decoder=modulated_decoder,
-                rich_mode=rich_mode,
                 fm_synth=fm_synth,
                 grain_synth=grain_synth,
                 transient_synth=transient_synth,

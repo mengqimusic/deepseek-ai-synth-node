@@ -60,14 +60,12 @@ class VoiceModule(nn.Module):
     A single Voice with independent developmental history.
 
     Shares decoder and DSP synth weights with other Voices but maintains
-    its own GRU/Transformer hidden state, EnergyBiasModule state buffers,
+    its own transformer hidden state, EnergyBiasModule state buffers,
     and developmental state.
 
-    Supports two modes:
-      - Legacy: DDSPDecoder (100 harm + 65 noise) + ModulatedDecoder
-      - Rich (Phase 10a): RichParamDecoder (256 harm + per-harm β +
-        formant + transient + FM + 65 mel noise + 65 grain noise)
-        + ModulatedRichDecoder
+    Uses RichParamDecoder (256 harm + per-harm β + formant + transient +
+    FM + 65 mel noise + 65 grain noise) with optional ModulatedRichDecoder
+    for hypernetwork-driven weight injection.
     """
 
     def __init__(
@@ -82,7 +80,6 @@ class VoiceModule(nn.Module):
         block_size: int = 64,
         modulated_decoder: nn.Module | None = None,
         energy_gain: float = 1.0,
-        rich_mode: bool = False,
         fm_synth: nn.Module | None = None,
         grain_synth: nn.Module | None = None,
         transient_synth: nn.Module | None = None,
@@ -97,7 +94,6 @@ class VoiceModule(nn.Module):
         self.block_size = block_size
         self.sample_rate = sample_rate
         self.frame_duration = block_size / sample_rate
-        self.rich_mode = rich_mode
 
         # Rich mode synths
         self.fm_synth = fm_synth
@@ -111,7 +107,7 @@ class VoiceModule(nn.Module):
             block_size=block_size,
         )
 
-        if rich_mode and hasattr(decoder, 'n_harmonics'):
+        if hasattr(decoder, 'n_harmonics'):
             if decoder.n_harmonics != n_harmonics:
                 raise ValueError(
                     f"Decoder outputs {decoder.n_harmonics} harmonics "
@@ -139,11 +135,9 @@ class VoiceModule(nn.Module):
         self._harmonic_phase: float = 0.0
 
         # Inharmonic synthesis state
-        self._inharmonicity: float = 0.0  # legacy: scalar β from tension
         self._harmonic_phase_inharmonic: torch.Tensor | None = None  # [n_harmonics] radians
 
         # Formant filter
-        self._resonance_level: float = 0.0
         self.formant_filter = FormantFilter(
             n_bands=3, sample_rate=sample_rate,
         )
@@ -275,8 +269,8 @@ class VoiceModule(nn.Module):
         """
         Generate synthesis parameters for this Voice.
 
-        Legacy mode returns dict with keys: harm_amps, noise_mags, f0_hz
-        Rich mode adds: inharm_beta, formant, transient, fm, noise_grain
+        Returns dict with keys: harm_amps, noise_mags, f0_hz, inharm_beta,
+        formant, transient, fm, noise_grain, plus competition/withdrawal fields.
 
         Args:
             f0_hz: fundamental frequency in Hz
@@ -292,11 +286,6 @@ class VoiceModule(nn.Module):
             target_levels = self._apply_phase_baseline(levels)
             effective_levels = self._apply_energy_dynamics(target_levels)
 
-            # Legacy: derive inharm β and resonance from energy levels
-            if not self.rich_mode:
-                self._inharmonicity = effective_levels["tension"] * 0.01
-                self._resonance_level = effective_levels["resonance"]
-
             for k in ENERGY_NAMES:
                 self.state.energy_accumulation[k] += effective_levels[k] * self.frame_duration
 
@@ -307,8 +296,7 @@ class VoiceModule(nn.Module):
             loudness = torch.tensor([[loudness_db]], device=device)
             f0_scaled = scale_f0(f0)
 
-            if self.rich_mode and self.modulated_decoder is not None:
-                # Rich modulated path
+            if self.modulated_decoder is not None:
                 boosts = self._compute_phase_boosts()
                 energy_tensor = torch.tensor([[
                     effective_levels["tension"] * boosts["tension"],
@@ -323,85 +311,39 @@ class VoiceModule(nn.Module):
                     xf_buffer=self._xf_buffer,
                     gru_hidden=self._gru_hidden,
                 )
-                harm = outputs["harm_amps"]
-                noise_mel = outputs["noise_mel"]
-
-                self._decoder_inharm_beta = outputs["inharm_beta"]
-                self._decoder_formant = outputs["formant"]
-                self._decoder_transient = outputs["transient"]
-                self._decoder_fm = outputs["fm"]
-                self._decoder_noise_grain = outputs["noise_grain"]
-
-            elif self.rich_mode:
-                # Rich vanilla path (no hypernetwork)
-                x = torch.stack([f0_scaled, loudness], dim=-1)
+            else:
                 outputs, self._xf_buffer, self._gru_hidden = self.decoder.forward_step(
                     f0_scaled, loudness,
                     xf_buffer=self._xf_buffer,
                     gru_hidden=self._gru_hidden,
                 )
-                harm = outputs["harm_amps"]
-                noise_mel = outputs["noise_mel"]
+            harm = outputs["harm_amps"]
+            noise_mel = outputs["noise_mel"]
 
-                self._decoder_inharm_beta = outputs["inharm_beta"]
-                self._decoder_formant = outputs["formant"]
-                self._decoder_transient = outputs["transient"]
-                self._decoder_fm = outputs["fm"]
-                self._decoder_noise_grain = outputs["noise_grain"]
+            self._decoder_inharm_beta = outputs["inharm_beta"]
+            self._decoder_formant = outputs["formant"]
+            self._decoder_transient = outputs["transient"]
+            self._decoder_fm = outputs["fm"]
+            self._decoder_noise_grain = outputs["noise_grain"]
 
-            elif self.modulated_decoder is not None:
-                # Legacy modulated path
-                boosts = self._compute_phase_boosts()
-                energy_tensor = torch.tensor([[
-                    effective_levels["tension"] * boosts["tension"],
-                    effective_levels["turbulence"] * boosts["turbulence"],
-                    effective_levels["resonance"] * boosts["resonance"],
-                    effective_levels["memory"] * boosts["memory"],
-                ]], device=device) * self.energy_gain
-                energy_tensor = torch.tanh(energy_tensor * 0.5)
-                harm, noise_mel, self._gru_hidden = self.modulated_decoder.forward_step(
-                    f0_scaled, loudness, energy_tensor, self._gru_hidden
-                )
-            else:
-                # Legacy vanilla path
-                x = torch.stack([f0_scaled, loudness], dim=-1)
-                x = self.decoder.pre_mlp(x)
-                x, h = self.decoder.gru(x, self._gru_hidden)
-                self._gru_hidden = h.detach()
-                x = self.decoder.post_mlp(x)
-                harm = torch.sigmoid(self.decoder.harm_head(x))
-                noise_mel = torch.sigmoid(self.decoder.noise_head(x))
-
-            # Energy bias post-processing (applies to harm and noise_mel regardless of mode)
+            # Energy bias post-processing
             harm, noise_mel = self.energy_module(harm, noise_mel, effective_levels)
 
-            if self.rich_mode:
-                return {
-                    "harm_amps": harm,
-                    "noise_mags": noise_mel,
-                    "f0_hz": f0_hz,
-                    "inharm_beta": self._decoder_inharm_beta,
-                    "formant": self._decoder_formant,
-                    "transient": self._decoder_transient,
-                    "fm": self._decoder_fm,
-                    "noise_grain": self._decoder_noise_grain,
-                    "competition_weight": self.state.competition_weight,
-                    "withdrawal_low": self.state.withdrawal_low,
-                    "withdrawal_mid": self.state.withdrawal_mid,
-                    "withdrawal_high": self.state.withdrawal_high,
-                    "is_active": True,
-                }
-            else:
-                return {
-                    "harm_amps": harm,
-                    "noise_mags": noise_mel,
-                    "f0_hz": f0_hz,
-                    "competition_weight": self.state.competition_weight,
-                    "withdrawal_low": self.state.withdrawal_low,
-                    "withdrawal_mid": self.state.withdrawal_mid,
-                    "withdrawal_high": self.state.withdrawal_high,
-                    "is_active": True,
-                }
+            return {
+                "harm_amps": harm,
+                "noise_mags": noise_mel,
+                "f0_hz": f0_hz,
+                "inharm_beta": self._decoder_inharm_beta,
+                "formant": self._decoder_formant,
+                "transient": self._decoder_transient,
+                "fm": self._decoder_fm,
+                "noise_grain": self._decoder_noise_grain,
+                "competition_weight": self.state.competition_weight,
+                "withdrawal_low": self.state.withdrawal_low,
+                "withdrawal_mid": self.state.withdrawal_mid,
+                "withdrawal_high": self.state.withdrawal_high,
+                "is_active": True,
+            }
 
     def _apply_turbulence_fm(
         self,
@@ -454,8 +396,8 @@ class VoiceModule(nn.Module):
 
         Args:
             params: dict from process_params with keys:
-                Legacy: harm_amps, noise_mags, f0_hz
-                Rich adds: inharm_beta, formant, transient, fm, noise_grain
+                harm_amps, noise_mags, f0_hz, inharm_beta, formant,
+                transient, fm, noise_grain
 
         Returns:
             audio: [block_size] numpy array
@@ -467,129 +409,85 @@ class VoiceModule(nn.Module):
             if isinstance(f0, (int, float)):
                 f0 = torch.tensor([[f0]], device=harm_amps.device, dtype=harm_amps.dtype)
 
-            # Turbulence FM (both modes)
+            # Turbulence FM
             noise_mags = self._apply_turbulence_fm(noise_mags, harm_amps)
 
             # Harmonic synthesis
-            if self.rich_mode:
-                inharm_beta = params.get("inharm_beta", None)
-                use_inharmonic = inharm_beta is not None and inharm_beta.abs().max() > 0
+            inharm_beta = params.get("inharm_beta", None)
+            use_inharmonic = inharm_beta is not None and inharm_beta.abs().max() > 0
 
-                if use_inharmonic:
-                    n_h = harm_amps.shape[-1]
-                    device = harm_amps.device
-                    dtype = harm_amps.dtype
+            if use_inharmonic:
+                n_h = harm_amps.shape[-1]
+                device = harm_amps.device
+                dtype = harm_amps.dtype
 
-                    if self._harmonic_phase_inharmonic is None:
-                        bridge_rad = self._harmonic_phase / self.harmonic_synth.table_size * (2.0 * math.pi)
-                        self._harmonic_phase_inharmonic = torch.full(
-                            (n_h,), bridge_rad, device=device, dtype=dtype
-                        )
-
-                    phase_start = self._harmonic_phase_inharmonic.unsqueeze(0)
-                    harm_audio, phase_end = self.harmonic_synth(
-                        harm_amps, f0,
-                        phase_start=phase_start,
-                        inharmonicity=inharm_beta,
+                if self._harmonic_phase_inharmonic is None:
+                    bridge_rad = self._harmonic_phase / self.harmonic_synth.table_size * (2.0 * math.pi)
+                    self._harmonic_phase_inharmonic = torch.full(
+                        (n_h,), bridge_rad, device=device, dtype=dtype
                     )
-                    self._harmonic_phase_inharmonic = phase_end[0]
-                    self._harmonic_phase = (
-                        phase_end[0, 0].item() / (2.0 * math.pi) * self.harmonic_synth.table_size
-                    ) % self.harmonic_synth.table_size
-                else:
-                    if self._harmonic_phase_inharmonic is not None:
-                        self._harmonic_phase = (
-                            self._harmonic_phase_inharmonic[0].item() / (2.0 * math.pi) * self.harmonic_synth.table_size
-                        ) % self.harmonic_synth.table_size
-                        self._harmonic_phase_inharmonic = None
 
-                    phase_start = torch.tensor(
-                        [self._harmonic_phase], device=harm_amps.device, dtype=harm_amps.dtype
-                    )
-                    harm_audio, phase_end = self.harmonic_synth(harm_amps, f0, phase_start=phase_start)
-                    self._harmonic_phase = phase_end[0].item()
-
-                # Formant filter (decoder-driven)
-                formant_params = params.get("formant", None)
-                if formant_params is not None:
-                    raw = formant_params  # [1, 1, 6]
-                    freqs = self._map_formant_freqs(raw[..., :3]).squeeze(0)  # [1, 3]
-                    qs = self._map_formant_qs(raw[..., 3:]).squeeze(0)
-                    harm_audio = self.formant_filter.forward_explicit(harm_audio, freqs, qs)
-
-                # FM synth
-                fm_params = params.get("fm", None)
-                fm_audio = None
-                if fm_params is not None and self.fm_synth is not None:
-                    fm_audio = self.fm_synth(fm_params, f0)
-
-                # Mel noise
-                noise_audio = self.noise_synth(noise_mags, generator=self._noise_gen)
-
-                # Grain noise
-                grain_params = params.get("noise_grain", None)
-                grain_audio = None
-                if grain_params is not None and self.grain_synth is not None:
-                    grain_audio = self.grain_synth(grain_params, generator=self._grain_gen)
-
-                # Transient comb noise
-                transient_params = params.get("transient", None)
-                transient_audio = None
-                if transient_params is not None and self.transient_synth is not None:
-                    transient_audio = self.transient_synth(transient_params)
-
-                # Sum
-                audio = harm_audio
-                if fm_audio is not None:
-                    audio = audio + fm_audio
-                audio = audio + noise_audio
-                if grain_audio is not None:
-                    audio = audio + grain_audio
-                if transient_audio is not None:
-                    audio = audio + transient_audio
-
+                phase_start = self._harmonic_phase_inharmonic.unsqueeze(0)
+                harm_audio, phase_end = self.harmonic_synth(
+                    harm_amps, f0,
+                    phase_start=phase_start,
+                    inharmonicity=inharm_beta,
+                )
+                self._harmonic_phase_inharmonic = phase_end[0]
+                self._harmonic_phase = (
+                    phase_end[0, 0].item() / (2.0 * math.pi) * self.harmonic_synth.table_size
+                ) % self.harmonic_synth.table_size
             else:
-                # Legacy synthesis path
-                if self._inharmonicity > 0.0:
-                    device = harm_amps.device
-                    dtype = harm_amps.dtype
-                    n_h = harm_amps.shape[-1]
-
-                    if self._harmonic_phase_inharmonic is None:
-                        bridge_rad = self._harmonic_phase / self.harmonic_synth.table_size * (2.0 * math.pi)
-                        self._harmonic_phase_inharmonic = torch.full(
-                            (n_h,), bridge_rad, device=device, dtype=dtype
-                        )
-
-                    beta = torch.tensor([[self._inharmonicity]], device=device, dtype=dtype)
-                    phase_start = self._harmonic_phase_inharmonic.unsqueeze(0)
-                    harm_audio, phase_end = self.harmonic_synth(
-                        harm_amps, f0,
-                        phase_start=phase_start,
-                        inharmonicity=beta,
-                    )
-                    self._harmonic_phase_inharmonic = phase_end[0]
+                if self._harmonic_phase_inharmonic is not None:
                     self._harmonic_phase = (
-                        phase_end[0, 0].item() / (2.0 * math.pi) * self.harmonic_synth.table_size
+                        self._harmonic_phase_inharmonic[0].item() / (2.0 * math.pi) * self.harmonic_synth.table_size
                     ) % self.harmonic_synth.table_size
-                else:
-                    if self._harmonic_phase_inharmonic is not None:
-                        self._harmonic_phase = (
-                            self._harmonic_phase_inharmonic[0].item() / (2.0 * math.pi) * self.harmonic_synth.table_size
-                        ) % self.harmonic_synth.table_size
-                        self._harmonic_phase_inharmonic = None
+                    self._harmonic_phase_inharmonic = None
 
-                    phase_start = torch.tensor(
-                        [self._harmonic_phase], device=harm_amps.device, dtype=harm_amps.dtype
-                    )
-                    harm_audio, phase_end = self.harmonic_synth(harm_amps, f0, phase_start=phase_start)
-                    self._harmonic_phase = phase_end[0].item()
+                phase_start = torch.tensor(
+                    [self._harmonic_phase], device=harm_amps.device, dtype=harm_amps.dtype
+                )
+                harm_audio, phase_end = self.harmonic_synth(harm_amps, f0, phase_start=phase_start)
+                self._harmonic_phase = phase_end[0].item()
 
-                if self._resonance_level > 0.0:
-                    r_level = torch.tensor([self._resonance_level], device=harm_audio.device, dtype=harm_audio.dtype)
-                    harm_audio = self.formant_filter(harm_audio, r_level)
+            # Formant filter (decoder-driven)
+            formant_params = params.get("formant", None)
+            if formant_params is not None:
+                raw = formant_params  # [1, 1, 6]
+                freqs = self._map_formant_freqs(raw[..., :3]).squeeze(0)  # [1, 3]
+                qs = self._map_formant_qs(raw[..., 3:]).squeeze(0)
+                harm_audio = self.formant_filter.forward_explicit(harm_audio, freqs, qs)
 
-                audio = harm_audio + self.noise_synth(noise_mags, generator=self._noise_gen)
+            # FM synth
+            fm_params = params.get("fm", None)
+            fm_audio = None
+            if fm_params is not None and self.fm_synth is not None:
+                fm_audio = self.fm_synth(fm_params, f0)
+
+            # Mel noise
+            noise_audio = self.noise_synth(noise_mags, generator=self._noise_gen)
+
+            # Grain noise
+            grain_params = params.get("noise_grain", None)
+            grain_audio = None
+            if grain_params is not None and self.grain_synth is not None:
+                grain_audio = self.grain_synth(grain_params, generator=self._grain_gen)
+
+            # Transient comb noise
+            transient_params = params.get("transient", None)
+            transient_audio = None
+            if transient_params is not None and self.transient_synth is not None:
+                transient_audio = self.transient_synth(transient_params)
+
+            # Sum
+            audio = harm_audio
+            if fm_audio is not None:
+                audio = audio + fm_audio
+            audio = audio + noise_audio
+            if grain_audio is not None:
+                audio = audio + grain_audio
+            if transient_audio is not None:
+                audio = audio + transient_audio
 
             return audio.squeeze(0).squeeze(0).cpu().numpy().astype("float32")
 
@@ -619,8 +517,6 @@ class VoiceModule(nn.Module):
         self._burst_energy = {k: 0.0 for k in ENERGY_NAMES}
         self._harmonic_phase = 0.0
         self._harmonic_phase_inharmonic = None
-        self._inharmonicity = 0.0
-        self._resonance_level = 0.0
         self._decoder_inharm_beta = None
         self._decoder_formant = None
         self._decoder_transient = None
