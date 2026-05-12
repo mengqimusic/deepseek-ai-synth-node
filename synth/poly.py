@@ -22,6 +22,7 @@ from synth.dsp.harmonic import WavetableHarmonicSynth
 from synth.dsp.noise import FilteredNoiseSynth
 from synth.voice import VoiceModule, VoiceState, ENERGY_NAMES
 from synth.competition import SpectralCompetitionScheduler
+from synth.feedback import FeedbackCoupler
 
 # Harmonic overlap proximity per semitone interval (1% tolerance, H=20 harmonics)
 # Consonant intervals (octave/fifth) → higher coupling; dissonant (tritone) → low.
@@ -131,6 +132,12 @@ class PolyphonicSynth(nn.Module):
 
         self.allocator = VoiceAllocator(num_voices=num_voices)
         self.competition = SpectralCompetitionScheduler()
+        self.feedback = FeedbackCoupler(
+            num_voices=num_voices,
+            n_harmonics=n_harmonics,
+            sample_rate=sample_rate,
+            block_size=block_size,
+        )
 
         # Per-voice energy injection levels (set externally by performer)
         self._energy_levels: list[dict[str, float]] = [
@@ -189,6 +196,45 @@ class PolyphonicSynth(nn.Module):
         return {}
 
     # ------------------------------------------------------------------
+    # Feedback control interface
+    # ------------------------------------------------------------------
+    def set_feedback_bypass(self, bypass: bool):
+        """Global kill-switch: True = all feedback mechanisms disabled."""
+        self.feedback.global_bypass = bypass
+
+    def set_feedback_self_enabled(self, enabled: bool):
+        self.feedback.self_feedback_enabled = enabled
+
+    def set_feedback_phase_lock_enabled(self, enabled: bool):
+        self.feedback.phase_lock_enabled = enabled
+
+    def set_feedback_diffusion_enabled(self, enabled: bool):
+        self.feedback.diffusion_enabled = enabled
+
+    def set_feedback_self_gain(self, gain: float):
+        self.feedback.set_self_feedback_gain(gain)
+
+    def set_feedback_phase_lock_gain(self, gain: float):
+        self.feedback.set_phase_lock_gain(gain)
+
+    def set_feedback_diffusion_rate(self, rate: float):
+        self.feedback.set_diffusion_rate(rate)
+
+    def get_feedback_state(self) -> dict:
+        """Return feedback status for TUI display."""
+        f = self.feedback
+        return {
+            "bypass": f.global_bypass,
+            "self_enabled": f.self_feedback_enabled,
+            "phase_lock_enabled": f.phase_lock_enabled,
+            "diffusion_enabled": f.diffusion_enabled,
+            "self_gain": f.self_feedback_gain,
+            "phase_lock_gain": f.phase_lock_gain,
+            "diffusion_rate": f.diffusion_rate,
+            "co_activation": f.get_co_activation_matrix(),
+        }
+
+    # ------------------------------------------------------------------
     # Audio generation
     # ------------------------------------------------------------------
     def process_frame(self) -> np.ndarray:
@@ -204,7 +250,8 @@ class PolyphonicSynth(nn.Module):
         active_voices = self.allocator.active_voices()
         active_notes = dict(self.allocator._active_notes)  # snapshot
 
-        # Step 0: energy crosstalk between active Voices
+        # Step 0: energy exchange — crosstalk + phase-lock coupling + diffusion
+        f0_active: dict[int, float] = {}  # voice_id → f0_hz (for diffusion)
         if len(active_voices) >= 2:
             active_list = sorted(active_voices)
             for i, vid_a in enumerate(active_list):
@@ -217,17 +264,36 @@ class PolyphonicSynth(nn.Module):
                         elif v == vid_b:
                             note_b = midi
                     if note_a is not None and note_b is not None:
+                        f0_a = midi_to_hz(note_a)
+                        f0_b = midi_to_hz(note_b)
+                        f0_active[vid_a] = f0_a
+                        f0_active[vid_b] = f0_b
+
                         semitone_dist = abs(note_a - note_b)
                         octave_shift = semitone_dist // 12
                         semitone_mod = semitone_dist % 12
-                        # Harmonic overlap lookup (1% tolerance, H=20)
                         base_proximity = _HARMONIC_PROXIMITY.get(semitone_mod, 0.1)
                         proximity = base_proximity * (0.7 ** octave_shift)
-                        if proximity > 0.01:
+
+                        # Phase-lock bonus: consonant f0 ratios get stronger coupling
+                        lock_strength = self.feedback.compute_phase_lock_strength(f0_a, f0_b)
+                        effective_proximity = proximity * (1.0 + lock_strength)
+
+                        if effective_proximity > 0.01:
                             voice_a = self.voices[vid_a]
                             voice_b = self.voices[vid_b]
-                            voice_a.apply_energy_crosstalk(voice_b._energy_smooth, proximity)
-                            voice_b.apply_energy_crosstalk(voice_a._energy_smooth, proximity)
+                            voice_a.apply_energy_crosstalk(voice_b._energy_smooth, effective_proximity)
+                            voice_b.apply_energy_crosstalk(voice_a._energy_smooth, effective_proximity)
+
+        # Energy field diffusion: all 5 Voices participate
+        energy_smooth_list = [
+            dict(self.voices[vid]._energy_smooth) for vid in range(self.num_voices)
+        ]
+        diffusion_deltas = self.feedback.step_diffusion(
+            energy_smooth_list, active_notes, f0_active
+        )
+        for vid in range(self.num_voices):
+            self.voices[vid].apply_feedback_energy(diffusion_deltas[vid])
 
         # Step 1: get biased params from each Voice
         voice_params = []
@@ -304,6 +370,20 @@ class PolyphonicSynth(nn.Module):
             else:
                 mixed += voice_audio.get(vid, np.zeros(self.block_size, dtype=np.float32))
 
+        # Step 4: self-feedback — harmonic output features → own energy state
+        # Uses post-competition harm_amps (what was actually synthesized).
+        # Gated by the performer's target levels so feedback amplifies intent
+        # rather than creating energy from nothing.
+        # Feedback affects the NEXT frame, not the current one.
+        for vp in param_list:
+            vid = vp["voice_id"]
+            if vp.get("is_active", False):
+                target_levels = self._energy_levels[vid]
+                deltas = self.feedback.compute_self_feedback(
+                    vid, vp["harm_amps"], target_levels
+                )
+                self.voices[vid].apply_feedback_energy(deltas)
+
         # Soft clip to prevent hard clipping with multi-voice mixing
         mixed = np.tanh(mixed)
         return mixed
@@ -372,6 +452,7 @@ class PolyphonicSynth(nn.Module):
         self._energy_levels = [
             {k: 0.0 for k in ENERGY_NAMES} for _ in range(self.num_voices)
         ]
+        self.feedback.reset_all()
 
     def reset_voice(self, voice_id: int):
         """Reset a single Voice (destructive)."""
@@ -381,3 +462,4 @@ class PolyphonicSynth(nn.Module):
                     del self.allocator._active_notes[midi]
             self.voices[voice_id].reset_full()
             self._energy_levels[voice_id] = {k: 0.0 for k in ENERGY_NAMES}
+            self.feedback.reset_voice(voice_id)

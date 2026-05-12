@@ -169,8 +169,23 @@ class VoiceModule(nn.Module):
             proximity: 0.0-1.0 frequency proximity (1.0 = same pitch)
         """
         for k in ENERGY_NAMES:
-            leak = source_levels.get(k, 0.0) * proximity * 0.1  # 10% base × proximity
+            leak = source_levels.get(k, 0.0) * proximity * 0.02  # 2% base × proximity
             self._energy_smooth[k] = min(1.0, self._energy_smooth[k] + leak)
+
+    def apply_feedback_energy(self, deltas: dict[str, float]):
+        """Apply feedback-derived energy deltas to smoothed energy state.
+
+        Distinct from performer injection (which sets target levels) and
+        crosstalk (which leaks between Voices based on frequency proximity).
+        Feedback closes the loop from audio output back to internal state.
+
+        Args:
+            deltas: per-direction energy increments from FeedbackCoupler
+        """
+        for k in ENERGY_NAMES:
+            d = deltas.get(k, 0.0)
+            if d != 0.0:
+                self._energy_smooth[k] = max(0.0, min(1.0, self._energy_smooth[k] + d))
 
     def _check_phase_transitions(self):
         """Check and apply irreversible phase transitions based on accumulation."""

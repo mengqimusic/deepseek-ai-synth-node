@@ -60,6 +60,15 @@ _voice_energy_smooth = [{k: 0.0 for k in ENERGY_NAMES} for _ in range(5)]
 _voice_trigger = [False] * 5
 _modulation_bypass = False  # set True to send zero energy to hypernetwork
 
+# Feedback coupling state (Phase 7 D3)
+_feedback_bypass = False
+_feedback_self_enabled = True
+_feedback_phase_lock_enabled = True
+_feedback_diffusion_enabled = True
+_feedback_self_gain = 0.008
+_feedback_phase_lock_gain = 0.10
+_feedback_diffusion_rate = 0.005
+
 # Stats (inference thread writes, main thread reads)
 _underrun_count = 0
 _overrun_count = 0
@@ -82,6 +91,15 @@ def inference_loop(synth: PolyphonicSynth, audio_queue: queue.Queue, block_size:
                 if _modulation_bypass:
                     levels = {k: 0.0 for k in ENERGY_NAMES}
                 synth.set_all_energy(vid, levels)
+
+            # Sync feedback settings
+            synth.set_feedback_bypass(_feedback_bypass)
+            synth.set_feedback_self_enabled(_feedback_self_enabled)
+            synth.set_feedback_phase_lock_enabled(_feedback_phase_lock_enabled)
+            synth.set_feedback_diffusion_enabled(_feedback_diffusion_enabled)
+            synth.set_feedback_self_gain(_feedback_self_gain)
+            synth.set_feedback_phase_lock_gain(_feedback_phase_lock_gain)
+            synth.set_feedback_diffusion_rate(_feedback_diffusion_rate)
 
         audio = synth.process_frame()
 
@@ -166,6 +184,9 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
     global _selected_voice, _voice_pitch, _voice_loudness, _running
     global _voice_energy_toggle, _voice_energy_smooth, _voice_trigger
     global _underrun_count, _overrun_count, _modulation_bypass
+    global _feedback_bypass, _feedback_self_enabled, _feedback_phase_lock_enabled
+    global _feedback_diffusion_enabled, _feedback_self_gain
+    global _feedback_phase_lock_gain, _feedback_diffusion_rate
 
     stdscr = curses.initscr()
     curses.noecho()
@@ -236,6 +257,20 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
 
             elif key == ord("m"):
                 _modulation_bypass = not _modulation_bypass
+
+            # — Feedback controls (Phase 7 D3) —
+            elif key == ord("f"):
+                _feedback_self_enabled = not _feedback_self_enabled
+            elif key == ord("g"):
+                _feedback_phase_lock_enabled = not _feedback_phase_lock_enabled
+            elif key == ord("h"):
+                _feedback_diffusion_enabled = not _feedback_diffusion_enabled
+            elif key == ord("F"):  # Shift+F = global feedback bypass
+                _feedback_bypass = not _feedback_bypass
+            elif key == ord("G"):  # Shift+G = increase self-feedback gain
+                _feedback_self_gain = min(0.5, _feedback_self_gain + 0.01)
+            elif key == ord("H"):  # Shift+H = increase diffusion rate
+                _feedback_diffusion_rate = min(0.2, _feedback_diffusion_rate + 0.005)
 
             elif key == ord(" "):  # Space: trigger note
                 with _lock:
@@ -385,7 +420,7 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
                 emap = ", ".join(f"{v}={ENERGY_LABELS[k]}" for k, v in ENERGY_KEYS.items())
                 stdscr.addstr(row, 2, f"Directions: {emap}")
                 row += 1
-                stdscr.addstr(row, 2, "↑↓:pitch  ←→:loudness  m:modulation bypass")
+                stdscr.addstr(row, 2, "↑↓:pitch  ←→:loudness  m:mod bypass  fgh:feedback toggle  F:fb bypass  GH:fb gain±")
                 row += 1
                 if has_modulation:
                     bypass_str = "ON (zero energy to HN)" if _modulation_bypass else "OFF (energy drives ΔW)"
@@ -393,6 +428,21 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
                 else:
                     stdscr.addstr(row, 2, "Modulation: N/A (no hypernetwork loaded)")
                 row += 1
+
+                # Feedback status (Phase 7 D3)
+                if _feedback_bypass:
+                    fb_status = "FEEDBACK BYPASSED (all mechanisms disabled)"
+                else:
+                    parts = []
+                    parts.append(f"self={'ON' if _feedback_self_enabled else 'OFF'}")
+                    parts.append(f"phase-lock={'ON' if _feedback_phase_lock_enabled else 'OFF'}")
+                    parts.append(f"diffusion={'ON' if _feedback_diffusion_enabled else 'OFF'}")
+                    parts.append(f"gain={_feedback_self_gain:.2f}")
+                    parts.append(f"rate={_feedback_diffusion_rate:.3f}")
+                    fb_status = "Feedback: " + "  ".join(parts)
+                stdscr.addstr(row, 2, fb_status)
+                row += 1
+
                 stdscr.addstr(row, 2, f"Phase thresholds: " + ", ".join(
                     f"{ENERGY_LABELS[k]}={PHASE_THRESHOLDS[k]:.0f}s" for k in ENERGY_NAMES
                 ))
