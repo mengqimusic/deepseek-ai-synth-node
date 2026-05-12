@@ -95,7 +95,7 @@ class VoiceModule(nn.Module):
         self.sample_rate = sample_rate
         self.frame_duration = block_size / sample_rate
 
-        # Rich mode synths
+        # DSP synthesis modules
         self.fm_synth = fm_synth
         self.grain_synth = grain_synth
         self.transient_synth = transient_synth
@@ -116,7 +116,7 @@ class VoiceModule(nn.Module):
 
         self.state = VoiceState(voice_id=voice_id)
         self._gru_hidden = None  # [1, 1, hidden_size] or None
-        self._xf_buffer = None   # [1, ctx, D] — transformer context (rich mode)
+        self._xf_buffer = None   # [1, ctx, D] — transformer context buffer
         self._noise_gen = torch.Generator()
         self._noise_gen.manual_seed(voice_id + 1)
         self._grain_gen = torch.Generator()
@@ -142,7 +142,7 @@ class VoiceModule(nn.Module):
             n_bands=3, sample_rate=sample_rate,
         )
 
-        # Decoder-generated params (rich mode — stored between process_params and synthesize_from)
+        # Decoder-generated params (stored between process_params and synthesize_from)
         self._decoder_inharm_beta: torch.Tensor | None = None
         self._decoder_formant: torch.Tensor | None = None
         self._decoder_transient: torch.Tensor | None = None
