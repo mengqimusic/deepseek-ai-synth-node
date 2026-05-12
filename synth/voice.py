@@ -330,6 +330,9 @@ class VoiceModule(nn.Module):
                     effective_levels["resonance"] * boosts["resonance"],
                     effective_levels["memory"] * boosts["memory"],
                 ]], device=device) * self.energy_gain
+                # Squash to [-1, 1] before hypernetwork to prevent tanh saturation.
+                # Effective range [0, ~5] maps to [0, ~0.987]; beyond 5 saturates gracefully.
+                energy_tensor = torch.tanh(energy_tensor * 0.5)
                 harm, noise, self._gru_hidden = self.modulated_decoder.forward_step(
                     f0_scaled, loudness, energy_tensor, self._gru_hidden
                 )
@@ -376,16 +379,22 @@ class VoiceModule(nn.Module):
             return noise_mags
 
         n_h = harm_amps.shape[-1]
-        # 3-band harmonic energy
-        h_low = harm_amps[:, :, :33].mean(dim=-1, keepdim=True)
-        h_mid = harm_amps[:, :, 33:66].mean(dim=-1, keepdim=True)
-        h_high = harm_amps[:, :, 66:].mean(dim=-1, keepdim=True)
+        n_m = noise_mags.shape[-1]
+        h_split1 = n_h // 3
+        h_split2 = 2 * n_h // 3
+        m_split1 = n_m // 3
+        m_split2 = 2 * n_m // 3
 
-        # Map to rough mel-band regions (65 mel bands: ~22 per region)
+        # 3-band harmonic energy
+        h_low = harm_amps[:, :, :h_split1].mean(dim=-1, keepdim=True)
+        h_mid = harm_amps[:, :, h_split1:h_split2].mean(dim=-1, keepdim=True)
+        h_high = harm_amps[:, :, h_split2:].mean(dim=-1, keepdim=True)
+
+        # Map to rough mel-band regions (split into 3 proportional bands)
         mod = torch.ones_like(noise_mags)
-        mod[:, :, :22] = 1.0 + h_low * 2.0 * mix
-        mod[:, :, 22:44] = 1.0 + h_mid * 2.0 * mix
-        mod[:, :, 44:] = 1.0 + h_high * 2.0 * mix
+        mod[:, :, :m_split1] = 1.0 + h_low * 2.0 * mix
+        mod[:, :, m_split1:m_split2] = 1.0 + h_mid * 2.0 * mix
+        mod[:, :, m_split2:] = 1.0 + h_high * 2.0 * mix
 
         return noise_mags * mod
 

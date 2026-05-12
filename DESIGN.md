@@ -634,14 +634,61 @@ audio = IFFT(100 harmonic amplitudes) + mel-filtered white noise
 | P4 | D. 扩大训练数据 | 高（数据+训练） | 根本性 | 扩展 decoder 音色词汇表，从根本上解决问题 |
 | P5 | E. 提高采样率/分辨率 | 高（影响实时性能） | 中 | 提升频谱精度和高频带宽 |
 
-### 11.3 推荐路线：Phase 9 "音色广度"
+### 11.3 路线图：战术补丁 → 战略升级
 
-将 P0+P1+P2 打包为一个 Phase（~4-6h）：
-- 8c.1 非谐波：WavetableHarmonicSynth 新增 `inharmonicity` 参数，频率 `k × f0 → k × f0 × (1 + β × (k² - 1))`
-- 8c.2 扩大调制：max_scale 0.12 → 0.30，评估 tanh 饱和问题
-- 8c.3 共振峰：2-3 并联带通滤波器，吟 (resonance) 控制 formant 位置和 Q
+音色广度问题分两层解决：
 
-P3+P4+P5 留到后续 Phase。
+#### Phase 9 "音色广度补丁"（战术，不改模型）
+
+在现有 258K 模型上扩展合成后端。不改 decoder 权重空间——只加新的合成参数，让同样的 decoder 输出能驱动更丰富的合成器。
+
+| 子任务 | 成本 | 收益 | 说明 |
+|--------|------|------|------|
+| P0 非谐波 | ~20 行 | 极大 | WavetableHarmonicSynth: `k×f0 → k×f0×(1+β×(k²-1))`，tension 控制 β |
+| P1 调制范围 | 改参数 | 大 | max_scale 0.12→0.30，解决 WR-01 tanh 饱和 |
+| P2 共振峰 | ~50 行 | 大 | 2-3 并联带通滤波器，吟 (resonance) 控制 formant 位置和 Q |
+
+约 4-6h。做完后 258K 模型驱动 3 条新信号路径，音色种类翻倍。
+
+#### Phase 10 "架构升级 — 方案 B 富参数合成引擎"（战略，换 decoder）
+
+Phase 9 是补丁，不解决根本问题——decoder 只学过 4 种音色。Phase 10 换掉 decoder 本身，但**保留 Hypernetwork / Energy Bias / Feedback / Competition 的完整上层**。
+
+**新 Decoder**：
+```
+(f0, loudness) → pre_mlp → 3-layer Transformer (256 dim, 4 heads)
+              → GRU(512) → post_mlp →
+              ├── 256 谐波振幅 + 每谐波 inharmonicity β
+              ├── 3 共振峰 (f1,f2,f3, Q1,Q2,Q3)
+              ├── 瞬态包络 (attack, burst, tilt, bandwidth)
+              ├── 2 条 FM 总线 (depth, ratio, feedback)
+              └── 多噪声源 (65 mel + 65 grain + comb)
+```
+~8M 参数，输出 ~680 个合成参数 (vs 当前 165)。Transformer 在单帧 (T=1) 退化为 MLP，推理仍极快。
+
+**合成后端扩展**：
+```
+audio = harmonic_synth(256 amps, f0, per-harm β)    ← 非谐波 wavetable
+      + formant_filter(harmonic_audio, 3×[f,Q])     ← 共振峰
+      + fm_synth(2×[mod→carrier], f0)               ← FM 总线
+      + noise_gen(65 mel + 65 grain + comb)          ← 多噪声源
+```
+
+**训练策略**：
+1. 冻结 decoder，用 multitimbral 数据训练新 output heads
+2. 解冻，在大规模多样化音频上端到端训练（合成后端在计算图中，梯度可穿透）
+3. 冻结 decoder，训练 Hypernetwork 的 energy→ΔW 映射
+
+**与 Phase 9 的关系**：Phase 9 新增的合成参数（inharmonicity、formant）直接变成 Phase 10 decoder 的输出目标。Phase 9 验证"这些参数有用"→ Phase 10 教 NN 自己生成这些参数。
+
+#### 后续
+
+| 优先级 | 方向 | 阶段 |
+|--------|------|------|
+| P3 | FM 合成路径 | Phase 10 合成后端的一部分 |
+| P4 | 扩大训练数据 | Phase 10 训练阶段 2 的输入 |
+| P5 | 提高采样率/分辨率 | Phase 10 训练时一起升级 |
+| — | 双速率架构（快通路 4ms + 慢通路 16ms） | Phase 10+ 性能优化 |
 
 ---
 
