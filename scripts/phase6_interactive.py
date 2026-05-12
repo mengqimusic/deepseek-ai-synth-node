@@ -55,8 +55,10 @@ _running = True
 _selected_voice = 0  # 0-4
 _voice_pitch = [67, 67, 67, 67, 67]
 _voice_loudness = [-10.0, -10.0, -10.0, -10.0, -10.0]
-_voice_energy_toggle = [{k: 0.0 for k in ENERGY_NAMES} for _ in range(5)]
+_voice_energy_target = [{k: 0.0 for k in ENERGY_NAMES} for _ in range(5)]
 _voice_energy_smooth = [{k: 0.0 for k in ENERGY_NAMES} for _ in range(5)]
+_key_hold = [{k: 0.0 for k in ENERGY_NAMES} for _ in range(5)]  # decay-based hold strength
+_KEY_HOLD_DECAY = 0.92  # ~130ms hold persistence between key repeats (~33ms gap × 4 = safe)
 _voice_trigger = [False] * 5
 _modulation_bypass = False  # set True to send zero energy to hypernetwork
 
@@ -65,7 +67,7 @@ _feedback_bypass = False
 _feedback_self_enabled = True
 _feedback_phase_lock_enabled = True
 _feedback_diffusion_enabled = True
-_feedback_self_gain = 0.008
+_feedback_self_gain = 0.05
 _feedback_phase_lock_gain = 0.10
 _feedback_diffusion_rate = 0.005
 
@@ -157,6 +159,25 @@ def _phase_marker(triggered: bool) -> str:
     return "◆" if triggered else "◇"
 
 
+def _phase_progress(accum: float, threshold: float, width: int = 16) -> tuple[str, float, int]:
+    """Build a progress bar with fraction toward phase transition.
+
+    Returns (bar_string, fraction, color_pair_index).
+    fraction = accum / threshold (may exceed 1.0)
+    color: 1=completed (green), 2=near (yellow), 3=normal (red)
+    """
+    fraction = accum / threshold if threshold > 0 else 1.0
+    filled = int(min(fraction, 1.0) * width)
+    bar = "█" * filled + "░" * (width - filled)
+    if fraction >= 1.0:
+        color = 1  # green: phase achieved
+    elif fraction >= 0.8:
+        color = 2  # yellow: about to transition
+    else:
+        color = 3  # red: accumulating
+    return bar, fraction, color
+
+
 def _midi_name(midi: int) -> str:
     names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
     return f"{names[midi % 12]}{midi // 12 - 1}"
@@ -184,7 +205,8 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
     import curses
 
     global _selected_voice, _voice_pitch, _voice_loudness, _running
-    global _voice_energy_toggle, _voice_energy_smooth, _voice_trigger
+    global _voice_energy_target, _voice_energy_smooth, _voice_trigger
+    global _key_hold
     global _underrun_count, _overrun_count, _modulation_bypass
     global _feedback_bypass, _feedback_self_enabled, _feedback_phase_lock_enabled
     global _feedback_diffusion_enabled, _feedback_self_gain
@@ -197,10 +219,21 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
     stdscr.nodelay(True)
     curses.curs_set(0)
 
-    # Smoothing
+    # Color pairs for phase progress (Phase 8c)
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)   # Phase completed
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)  # Near transition (>80%)
+        curses.init_pair(3, curses.COLOR_RED, -1)     # Default progress
+        curses.init_pair(4, curses.COLOR_CYAN, -1)    # Active highlight
+
+    # Smoothing — continuous hold-to-ramp / release-to-decay
     smooth = [{k: 0.0 for k in ENERGY_NAMES} for _ in range(5)]
-    attack_alpha = 1.0 - math.exp(-0.004 / 0.030)
-    release_alpha = 1.0 - math.exp(-0.004 / 0.150)
+    attack_ms = 500.0
+    release_ms = 1200.0
+    attack_alpha = 1.0 - math.exp(-0.004 / (attack_ms / 1000.0))
+    release_alpha = 1.0 - math.exp(-0.004 / (release_ms / 1000.0))
 
     # Audio queue + inference thread
     audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_DEPTH)
@@ -229,6 +262,11 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
         last_tui = 0.0
 
         while _running:
+            # Decay key hold strength each frame (~130ms persistence)
+            for v in range(5):
+                for k in ENERGY_NAMES:
+                    _key_hold[v][k] *= _KEY_HOLD_DECAY
+
             key = stdscr.getch()
             now = time.time()
             vid = _selected_voice
@@ -241,21 +279,13 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
             elif key == ord("5"): _selected_voice = 4
 
             elif key == ord("q"):
-                _voice_energy_toggle[vid]["tension"] = (
-                    1.0 if _voice_energy_smooth[vid]["tension"] < 0.5 else 0.0
-                )
+                _key_hold[vid]["tension"] = 1.0
             elif key == ord("w"):
-                _voice_energy_toggle[vid]["turbulence"] = (
-                    1.0 if _voice_energy_smooth[vid]["turbulence"] < 0.5 else 0.0
-                )
+                _key_hold[vid]["turbulence"] = 1.0
             elif key == ord("e"):
-                _voice_energy_toggle[vid]["resonance"] = (
-                    1.0 if _voice_energy_smooth[vid]["resonance"] < 0.5 else 0.0
-                )
+                _key_hold[vid]["resonance"] = 1.0
             elif key == ord("r"):
-                _voice_energy_toggle[vid]["memory"] = (
-                    1.0 if _voice_energy_smooth[vid]["memory"] < 0.5 else 0.0
-                )
+                _key_hold[vid]["memory"] = 1.0
 
             elif key == ord("m"):
                 _modulation_bypass = not _modulation_bypass
@@ -269,10 +299,19 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
                 _feedback_diffusion_enabled = not _feedback_diffusion_enabled
             elif key == ord("F"):  # Shift+F = global feedback bypass
                 _feedback_bypass = not _feedback_bypass
-            elif key == ord("G"):  # Shift+G = increase self-feedback gain
-                _feedback_self_gain = min(0.5, _feedback_self_gain + 0.01)
+            # Self-feedback gain controls (Phase 8b — chaos regime)
+            elif key == ord("]"):
+                _feedback_self_gain = min(5.0, _feedback_self_gain + 0.05)
+            elif key == ord("["):
+                _feedback_self_gain = max(0.0, _feedback_self_gain - 0.05)
+            elif key == ord("}"):  # Shift+] = coarse up
+                _feedback_self_gain = min(5.0, _feedback_self_gain + 0.5)
+            elif key == ord("{"):  # Shift+[ = coarse down
+                _feedback_self_gain = max(0.0, _feedback_self_gain - 0.5)
             elif key == ord("H"):  # Shift+H = increase diffusion rate
                 _feedback_diffusion_rate = min(0.2, _feedback_diffusion_rate + 0.005)
+            elif key == ord("G"):  # Shift+G = decrease diffusion rate
+                _feedback_diffusion_rate = max(0.0, _feedback_diffusion_rate - 0.005)
 
             elif key == ord(" "):  # Space: trigger note
                 with _lock:
@@ -299,16 +338,21 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
             elif key == ord("x"):  # reset selected Voice
                 with _lock:
                     synth.reset_voice(vid)
-                _voice_energy_toggle[vid] = {k: 0.0 for k in ENERGY_NAMES}
+                _voice_energy_target[vid] = {k: 0.0 for k in ENERGY_NAMES}
                 smooth[vid] = {k: 0.0 for k in ENERGY_NAMES}
 
             elif key == 27:  # Esc
                 break
 
-            # — Energy smoothing —
+            # — Map key hold to energy targets (decay-based, bridges auto-repeat gaps) —
             for v in range(5):
                 for k in ENERGY_NAMES:
-                    target = _voice_energy_toggle[v][k]
+                    _voice_energy_target[v][k] = 1.0 if _key_hold[v][k] > 0.5 else 0.0
+
+            # — Energy smoothing (attack on held, release on released) —
+            for v in range(5):
+                for k in ENERGY_NAMES:
+                    target = _voice_energy_target[v][k]
                     alpha = attack_alpha if target > smooth[v][k] else release_alpha
                     smooth[v][k] += alpha * (target - smooth[v][k])
 
@@ -393,6 +437,29 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
                     stdscr.addstr(row, 26, accum_str)
                     row += 1
 
+                    # Phase transition progress bars with color (Phase 8c)
+                    if row < h - 8 and curses.has_colors():
+                        labels = ["tension", "turbulence", "resonance", "memory"]
+                        col = 2
+                        for k in labels:
+                            pbar, frac, color = _phase_progress(
+                                st.energy_accumulation[k], PHASE_THRESHOLDS[k]
+                            )
+                            marker = _phase_marker(
+                                getattr(st, f"phase_{k}")
+                            )
+                            triggered = getattr(st, f"phase_{k}")
+                            pct_str = "饱和" if triggered else f"{min(frac*100, 99):2.0f}%"
+                            segment = f" {ENERGY_LABELS[k]}{marker} ["
+                            stdscr.addstr(row, col, segment)
+                            col += len(segment)
+                            stdscr.addstr(row, col, pbar, curses.color_pair(color))
+                            col += len(pbar)
+                            tail = f"] {pct_str} "
+                            stdscr.addstr(row, col, tail)
+                            col += len(tail)
+                        row += 1
+
                     # Hypernetwork energy vector
                     hn_str = " | ".join(
                         f"{ENERGY_LABELS[k]}={smooth[vid][k]:.3f}"
@@ -417,12 +484,12 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
                 row += 1
                 stdscr.addstr(row, 2, "─" * min(82, w - 4))
                 row += 1
-                stdscr.addstr(row, 2, "1-5:select Voice  qwer:toggle energy  Space:note on  z:release voice  a:all off  x:reset")
+                stdscr.addstr(row, 2, "1-5:select Voice  qwer:hold energy (0.5s attack / 1.2s release)  Space:note on  z:release voice  a:all off  x:reset")
                 row += 1
                 emap = ", ".join(f"{v}={ENERGY_LABELS[k]}" for k, v in ENERGY_KEYS.items())
                 stdscr.addstr(row, 2, f"Directions: {emap}")
                 row += 1
-                stdscr.addstr(row, 2, "↑↓:pitch  ←→:loudness  m:mod bypass  fgh:feedback toggle  F:fb bypass  GH:fb gain±")
+                stdscr.addstr(row, 2, "↑↓:pitch  ←→:loudness  m:mod bypass  fgh:feedback toggle  F:fb bypass  []:gain±  {}:gain±±")
                 row += 1
                 if has_modulation:
                     bypass_str = "ON (zero energy to HN)" if _modulation_bypass else "OFF (energy drives ΔW)"
@@ -431,7 +498,7 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
                     stdscr.addstr(row, 2, "Modulation: N/A (no hypernetwork loaded)")
                 row += 1
 
-                # Feedback status (Phase 7 D3)
+                # Feedback status (Phase 7 D3 + Phase 8b chaos)
                 if _feedback_bypass:
                     fb_status = "FEEDBACK BYPASSED (all mechanisms disabled)"
                 else:
@@ -441,6 +508,19 @@ def run_interactive(synth: PolyphonicSynth, block_size: int, sample_rate: int,
                     parts.append(f"diffusion={'ON' if _feedback_diffusion_enabled else 'OFF'}")
                     parts.append(f"gain={_feedback_self_gain:.2f}")
                     parts.append(f"rate={_feedback_diffusion_rate:.3f}")
+                    # Chaos regime indicator (gain-based heuristic)
+                    g = _feedback_self_gain
+                    if g < 0.2:
+                        regime = "stable"
+                    elif g < 0.8:
+                        regime = "reactive"
+                    elif g < 1.5:
+                        regime = "edge"
+                    elif g < 3.5:
+                        regime = "periodic"
+                    else:
+                        regime = "chaotic"
+                    parts.append(f"[{regime}]")
                     fb_status = "Feedback: " + "  ".join(parts)
                 stdscr.addstr(row, 2, fb_status)
                 row += 1
@@ -588,7 +668,7 @@ def main():
         print(f"Loaded base model (step {ckpt['step']}) — no hypernetwork")
 
     print("Phase 6 Interactive — Hypernetwork + 5 Voice Performance Pipeline")
-    print("Keys: 1-5=select voice  qwer=toggle energy  Space=note  m=bypass  Esc=quit")
+    print("Keys: 1-5=select voice  qwer=hold energy  Space=note  m=bypass  Esc=quit")
     print("Starting...")
 
     try:

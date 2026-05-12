@@ -186,22 +186,66 @@ class VoiceModule(nn.Module):
         for k in ENERGY_NAMES:
             d = deltas.get(k, 0.0)
             if d != 0.0:
+                # Phase unlock: memory feedback strengthened (Phase 8c)
+                if k == "memory" and self.state.phase_memory:
+                    accum = self.state.energy_accumulation["memory"]
+                    threshold = PHASE_THRESHOLDS["memory"]
+                    boost = 1.0 + min(1.0, max(0.0, (accum - threshold) / 10.0))
+                    d *= boost  # up to 2× for phase_memory
                 self._energy_smooth[k] = max(0.0, min(1.0, self._energy_smooth[k] + d))
 
+    def _compute_phase_boosts(self) -> dict[str, float]:
+        """Compute per-direction energy gain boosts from phase unlocks.
+
+        Post-transition, each direction's effective energy gain scales
+        progressively with accumulation beyond the threshold,
+        from 1.0 (at transition) up to 5.0 (at transition + 20s).
+
+        Returns:
+            dict of {direction: boost_multiplier} — 1.0 = no boost.
+        """
+        boosts = {k: 1.0 for k in ENERGY_NAMES}
+        phase_map = {
+            "tension": self.state.phase_tension,
+            "turbulence": self.state.phase_turbulence,
+            "resonance": self.state.phase_resonance,
+            "memory": self.state.phase_memory,
+        }
+        for k in ENERGY_NAMES:
+            if phase_map[k]:
+                accum = self.state.energy_accumulation[k]
+                threshold = PHASE_THRESHOLDS[k]
+                extra = (accum - threshold) * 0.2  # +1.0 per 5s beyond threshold
+                boosts[k] = 1.0 + min(4.0, max(0.0, extra))
+        return boosts
+
     def _check_phase_transitions(self):
-        """Check and apply irreversible phase transitions based on accumulation."""
+        """Check and apply irreversible phase transitions based on accumulation.
+
+        On transition, injects an audible burst cue (~200ms harmonic shimmer)
+        so the performer perceives the developmental milestone.
+        """
         for direction in ENERGY_NAMES:
             accum = self.state.energy_accumulation[direction]
             threshold = PHASE_THRESHOLDS[direction]
+            triggered = False
 
             if direction == "tension" and not self.state.phase_tension and accum >= threshold:
                 self.state.phase_tension = True
+                triggered = True
             elif direction == "turbulence" and not self.state.phase_turbulence and accum >= threshold:
                 self.state.phase_turbulence = True
+                triggered = True
             elif direction == "resonance" and not self.state.phase_resonance and accum >= threshold:
                 self.state.phase_resonance = True
+                triggered = True
             elif direction == "memory" and not self.state.phase_memory and accum >= threshold:
                 self.state.phase_memory = True
+                triggered = True
+
+            if triggered:
+                # Audible cue: brief harmonic burst on the triggering direction
+                self._burst_energy[direction] = min(1.0, self._burst_energy[direction] + 0.5)
 
     def _update_competition_profile(self):
         """Update competition weight and withdrawal style from accumulation history."""
@@ -278,11 +322,13 @@ class VoiceModule(nn.Module):
             f0_scaled = scale_f0(f0)
 
             if self.modulated_decoder is not None:
+                # Phase-based per-direction gain boosts (Phase 8c)
+                boosts = self._compute_phase_boosts()
                 energy_tensor = torch.tensor([[
-                    effective_levels["tension"],
-                    effective_levels["turbulence"],
-                    effective_levels["resonance"],
-                    effective_levels["memory"]
+                    effective_levels["tension"] * boosts["tension"],
+                    effective_levels["turbulence"] * boosts["turbulence"],
+                    effective_levels["resonance"] * boosts["resonance"],
+                    effective_levels["memory"] * boosts["memory"],
                 ]], device=device) * self.energy_gain
                 harm, noise, self._gru_hidden = self.modulated_decoder.forward_step(
                     f0_scaled, loudness, energy_tensor, self._gru_hidden
@@ -300,6 +346,48 @@ class VoiceModule(nn.Module):
             harm, noise = self.energy_module(harm, noise, effective_levels)
 
             return harm, noise, f0
+
+    def _apply_turbulence_fm(
+        self,
+        noise_mags: torch.Tensor,
+        harm_amps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Modulate noise magnitudes by harmonic structure (turbulence FM).
+
+        When phase_turbulence is active, noise energy concentrates near
+        harmonic peaks — the "边带分叉" (sideband bifurcation) effect.
+        Modulation depth scales with turbulence accumulation beyond threshold.
+
+        Args:
+            noise_mags: [1, 1, n_magnitudes] — mel-band noise magnitudes
+            harm_amps: [1, 1, n_harmonics] — harmonic amplitudes
+
+        Returns:
+            noise_mags: [1, 1, n_magnitudes] — FM-modulated
+        """
+        if not self.state.phase_turbulence:
+            return noise_mags
+
+        accum = self.state.energy_accumulation["turbulence"]
+        threshold = PHASE_THRESHOLDS["turbulence"]
+        mix = min(1.0, max(0.0, (accum - threshold) / 10.0))  # 0→1 over 10s
+
+        if mix < 0.01:
+            return noise_mags
+
+        n_h = harm_amps.shape[-1]
+        # 3-band harmonic energy
+        h_low = harm_amps[:, :, :33].mean(dim=-1, keepdim=True)
+        h_mid = harm_amps[:, :, 33:66].mean(dim=-1, keepdim=True)
+        h_high = harm_amps[:, :, 66:].mean(dim=-1, keepdim=True)
+
+        # Map to rough mel-band regions (65 mel bands: ~22 per region)
+        mod = torch.ones_like(noise_mags)
+        mod[:, :, :22] = 1.0 + h_low * 2.0 * mix
+        mod[:, :, 22:44] = 1.0 + h_mid * 2.0 * mix
+        mod[:, :, 44:] = 1.0 + h_high * 2.0 * mix
+
+        return noise_mags * mod
 
     def synthesize_from(
         self,
@@ -322,6 +410,9 @@ class VoiceModule(nn.Module):
             audio: [block_size] numpy array
         """
         with torch.no_grad():
+            # Turbulence FM: noise tracks harmonic structure (Phase 8c)
+            noise_mags = self._apply_turbulence_fm(noise_mags, harm_amps)
+
             phase_start = torch.tensor([self._harmonic_phase], device=harm_amps.device, dtype=harm_amps.dtype)
             harm_audio, phase_end = self.harmonic_synth(harm_amps, f0_hz, phase_start=phase_start)
             self._harmonic_phase = phase_end[0].item()

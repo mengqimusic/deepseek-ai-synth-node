@@ -62,7 +62,7 @@ class FeedbackCoupler(nn.Module):
         self.global_bypass: bool = False  # master kill-switch
 
         # ---- Gain parameters (tunable) ----
-        self.self_feedback_gain: float = 0.008   # per-frame feedback injection strength
+        self.self_feedback_gain: float = 0.05   # per-frame feedback injection strength [0, 5.0]
         self.phase_lock_gain: float = 0.10       # extra crosstalk multiplier for locked pairs
         self.diffusion_rate: float = 0.005       # per-frame energy equalization rate
 
@@ -335,8 +335,8 @@ class FeedbackCoupler(nn.Module):
         self._co_activation.zero_()
 
     def set_self_feedback_gain(self, gain: float):
-        """Set self-feedback gain (0.0 = off, 1.0 = strong)."""
-        self.self_feedback_gain = max(0.0, min(1.0, gain))
+        """Set self-feedback gain (0.0 = off, 1.0 = strong, 5.0 = chaos)."""
+        self.self_feedback_gain = max(0.0, min(5.0, gain))
 
     def set_phase_lock_gain(self, gain: float):
         """Set phase-lock coupling gain."""
