@@ -103,15 +103,15 @@ def inference_loop(synth: PolyphonicSynth, audio_queue: queue.Queue, block_size:
 
         audio = synth.process_frame()
 
-        # Throttle: if queue is filling up, skip this frame to let audio drain.
-        # This prevents runaway overruns when inference is faster than playback.
-        if audio_queue.qsize() >= AUDIO_QUEUE_DEPTH - 4:
+        # Blocking put: naturally paces the inference loop to the audio
+        # callback's consumption rate.  When inference is faster than audio,
+        # this blocks until the callback drains a frame.  When inference is
+        # slower, the callback sees queue.Empty (underrun) and repeats the
+        # last frame — acceptable for real-time synthesis.
+        try:
+            audio_queue.put(audio, timeout=0.02)  # 20ms = 5 frame periods
+        except queue.Full:
             _overrun_count += 1
-        else:
-            try:
-                audio_queue.put_nowait(audio)
-            except queue.Full:
-                _overrun_count += 1
 
 
 def audio_callback_factory(audio_queue: queue.Queue, block_size: int):
