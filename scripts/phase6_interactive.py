@@ -92,26 +92,26 @@ def inference_loop(synth: PolyphonicSynth, audio_queue: queue.Queue, block_size:
                     levels = {k: 0.0 for k in ENERGY_NAMES}
                 synth.set_all_energy(vid, levels)
 
-            # Sync feedback settings
-            synth.set_feedback_bypass(_feedback_bypass)
-            synth.set_feedback_self_enabled(_feedback_self_enabled)
-            synth.set_feedback_phase_lock_enabled(_feedback_phase_lock_enabled)
-            synth.set_feedback_diffusion_enabled(_feedback_diffusion_enabled)
-            synth.set_feedback_self_gain(_feedback_self_gain)
-            synth.set_feedback_phase_lock_gain(_feedback_phase_lock_gain)
-            synth.set_feedback_diffusion_rate(_feedback_diffusion_rate)
+        # Feedback sync (read-only globals, no lock needed)
+        synth.set_feedback_bypass(_feedback_bypass)
+        synth.set_feedback_self_enabled(_feedback_self_enabled)
+        synth.set_feedback_phase_lock_enabled(_feedback_phase_lock_enabled)
+        synth.set_feedback_diffusion_enabled(_feedback_diffusion_enabled)
+        synth.set_feedback_self_gain(_feedback_self_gain)
+        synth.set_feedback_phase_lock_gain(_feedback_phase_lock_gain)
+        synth.set_feedback_diffusion_rate(_feedback_diffusion_rate)
 
         audio = synth.process_frame()
 
-        try:
-            audio_queue.put(audio, timeout=0.1)
-        except queue.Full:
+        # Throttle: if queue is filling up, skip this frame to let audio drain.
+        # This prevents runaway overruns when inference is faster than playback.
+        if audio_queue.qsize() >= AUDIO_QUEUE_DEPTH - 4:
             _overrun_count += 1
+        else:
             try:
-                audio_queue.get_nowait()
                 audio_queue.put_nowait(audio)
-            except queue.Empty:
-                pass
+            except queue.Full:
+                _overrun_count += 1
 
 
 def audio_callback_factory(audio_queue: queue.Queue, block_size: int):
@@ -120,6 +120,7 @@ def audio_callback_factory(audio_queue: queue.Queue, block_size: int):
     last_chunk = np.zeros(block_size, dtype=np.float32)
 
     def callback(outdata, frames, _time, status):
+        nonlocal last_chunk
         if status:
             print(f"audio status: {status}", file=sys.stderr)
 
